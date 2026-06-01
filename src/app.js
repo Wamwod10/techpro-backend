@@ -51,6 +51,12 @@ app.use((req, res) => {
 });
 
 app.use((error, req, res, next) => {
+  const prismaMessages = {
+    P2002: "Bu ma'lumot bilan yozuv allaqachon mavjud",
+    P2003: "Bu yozuv boshqa ma'lumotlarga bog'langan",
+    P2025: "Ma'lumot topilmadi",
+  };
+
   console.error("[API ERROR]", {
     method: req.method,
     url: req.originalUrl,
@@ -61,7 +67,7 @@ app.use((error, req, res, next) => {
   console.error(error);
 
   res.status(error.status || 500).json({
-    message: error.message || "Serverning eng katta xatosi",
+    message: prismaMessages[error.code] || error.message || "Server xatosi",
   });
 });
 

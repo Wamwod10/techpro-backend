@@ -31,6 +31,8 @@ const activeProductWhere = {
   isDeleted: false,
 };
 
+const isAdminUser = (user) => user?.role === "admin";
+
 const getCanonicalQuantity = (product) => {
   const quantity = Number(product?.quantity ?? 0);
   const legacyStock = Number(product?.stock ?? 0);
@@ -70,6 +72,26 @@ const normalizeProductInput = (data) => {
     supplierPhone: data.supplierPhone || "",
     date: data.date || null,
   };
+};
+
+const validateProductInput = (input) => {
+  if (!String(input.name || "").trim()) {
+    throw Object.assign(new Error("Mahsulot nomi kiritilishi kerak"), {
+      status: 400,
+    });
+  }
+
+  if (Number(input.sellPrice || 0) < 0 || Number(input.costPrice || 0) < 0) {
+    throw Object.assign(new Error("Mahsulot narxi noto'g'ri"), {
+      status: 400,
+    });
+  }
+
+  if (Number(input.quantity || 0) < 0) {
+    throw Object.assign(new Error("Mahsulot soni manfiy bo'lishi mumkin emas"), {
+      status: 400,
+    });
+  }
 };
 
 const normalizeSupplierInput = (data) => ({
@@ -190,15 +212,34 @@ const getDebtAdjustment = (previousProduct, nextProduct) => {
   return nextDebt - previousDebt;
 };
 
-const toProductDto = (product) => ({
-  ...product,
-  quantity: getCanonicalQuantity(product),
-  sellPrice: Number(product.sellPrice ?? product.price ?? 0),
-});
+const toProductDto = (product, { includeSensitive = true } = {}) => {
+  const dto = {
+    ...product,
+    quantity: getCanonicalQuantity(product),
+    sellPrice: Number(product.sellPrice ?? product.price ?? 0),
+  };
 
-const toSaleDto = (sale) => ({
+  if (!includeSensitive) {
+    delete dto.costPrice;
+    delete dto.supplier;
+    delete dto.paymentStatus;
+    delete dto.debtAmount;
+    delete dto.supplierPhone;
+    delete dto.returnDays;
+    delete dto.date;
+  }
+
+  return dto;
+};
+
+const toSaleDto = (sale, { includeSensitive = true } = {}) => ({
   ...sale,
-  items: sale.items || [],
+  items: (sale.items || []).map((item) => {
+    if (includeSensitive) return item;
+
+    const { costPrice, ...safeItem } = item;
+    return safeItem;
+  }),
 });
 
 const getPaymentTotal = (sales, paymentMethod) =>
@@ -206,21 +247,43 @@ const getPaymentTotal = (sales, paymentMethod) =>
     .filter((sale) => sale.paymentMethod === paymentMethod)
     .reduce((acc, sale) => acc + Number(sale.total || 0) - Number(sale.returnedTotal || 0), 0);
 
-const addActivityLog = (data, user, client = prisma) =>
-  client.activityLog.create({
-    data: {
-      type: data.type || "general",
-      title: data.title || "Amal bajarildi",
-      description: data.description || "",
-      userId: user?.id,
-      userName: data.userName || user?.name || "Noma'lum foydalanuvchi",
-      userRole: data.userRole || user?.role || "unknown",
-      date: toUzDate(),
-      time: toUzTime(),
+const addActivityLog = async (data, user, client = prisma) => {
+  const logData = {
+    type: data.type || "general",
+    title: data.title || "Amal bajarildi",
+    description: data.description || "",
+    userId: user?.id,
+    userName: user?.name || "Noma'lum foydalanuvchi",
+    userRole: user?.role || "unknown",
+    date: toUzDate(),
+    time: toUzTime(),
+  };
+
+  const duplicate = await client.activityLog.findFirst({
+    where: {
+      type: logData.type,
+      title: logData.title,
+      description: logData.description,
+      userId: logData.userId,
+      createdAt: {
+        gte: new Date(Date.now() - 8000),
+      },
     },
+    orderBy: { createdAt: "desc" },
   });
 
-const buildHistory = async () => {
+  if (duplicate) {
+    return duplicate;
+  }
+
+  return client.activityLog.create({
+    data: {
+      ...logData,
+    },
+  });
+};
+
+const buildHistory = async ({ includeSensitive = true } = {}) => {
   const days = await prisma.salesDay.findMany({
     orderBy: { dateISO: "desc" },
   });
@@ -233,7 +296,9 @@ const buildHistory = async () => {
 
   return days.map((day) => ({
     ...day,
-    sales: sales.filter((sale) => sale.dateISO === day.dateISO).map(toSaleDto),
+    sales: sales
+      .filter((sale) => sale.dateISO === day.dateISO)
+      .map((sale) => toSaleDto(sale, { includeSensitive })),
   }));
 };
 
@@ -290,6 +355,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const todayISO = toISODate();
     const includeHistory = req.query.includeHistory === "true";
+    const includeSensitive = isAdminUser(req.user);
 
     const [
       inventory,
@@ -311,22 +377,32 @@ router.get(
         include: saleInclude,
         orderBy: { createdAt: "desc" },
       }),
-      prisma.supplier.findMany({
-        include: { transactions: { orderBy: { createdAt: "desc" } } },
-        orderBy: { createdAt: "desc" },
-      }),
-      prisma.expense.findMany({ orderBy: { createdAt: "desc" } }),
+      includeSensitive
+        ? prisma.supplier.findMany({
+            include: { transactions: { orderBy: { createdAt: "desc" } } },
+            orderBy: { createdAt: "desc" },
+          })
+        : Promise.resolve([]),
+      includeSensitive
+        ? prisma.expense.findMany({ orderBy: { createdAt: "desc" } })
+        : Promise.resolve([]),
       prisma.return.findMany({ orderBy: { createdAt: "desc" } }),
       prisma.shift.findFirst({ where: { status: "open" }, orderBy: { createdAt: "desc" } }),
       prisma.shift.findMany({ where: { status: "closed" }, orderBy: { closedAtISO: "desc" } }),
-      prisma.activityLog.findMany({ orderBy: { createdAt: "desc" }, take: 500 }),
-      getTelegramSettings(),
+      includeSensitive
+        ? prisma.activityLog.findMany({ orderBy: { createdAt: "desc" }, take: 500 })
+        : Promise.resolve([]),
+      includeSensitive ? getTelegramSettings() : Promise.resolve(null),
     ]);
 
     res.json({
-      inventory: inventory.map(toProductDto),
-      dailySales: dailySales.map(toSaleDto),
-      salesHistory: includeHistory ? await buildHistory() : [],
+      inventory: inventory.map((product) =>
+        toProductDto(product, { includeSensitive }),
+      ),
+      dailySales: dailySales.map((sale) =>
+        toSaleDto(sale, { includeSensitive }),
+      ),
+      salesHistory: includeHistory ? await buildHistory({ includeSensitive }) : [],
       suppliers: suppliers.map(toSupplierDto),
       expenses,
       returns,
@@ -341,12 +417,15 @@ router.get(
 router.get(
   "/products",
   asyncHandler(async (req, res) => {
+    const includeSensitive = isAdminUser(req.user);
     const products = await prisma.product.findMany({
       where: activeProductWhere,
       orderBy: { createdAt: "desc" },
     });
 
-    res.json(products.map(toProductDto));
+    res.json(
+      products.map((product) => toProductDto(product, { includeSensitive })),
+    );
   }),
 );
 
@@ -355,6 +434,7 @@ router.post(
   requireRole("admin"),
   asyncHandler(async (req, res) => {
     const productInput = normalizeProductInput(req.body);
+    validateProductInput(productInput);
 
     const { product, supplier } = await prisma.$transaction(async (tx) => {
       const reviveFilters = [
@@ -436,6 +516,7 @@ router.put(
   requireRole("admin"),
   asyncHandler(async (req, res) => {
     const productInput = normalizeProductInput(req.body);
+    validateProductInput(productInput);
 
     const { previous, product, supplier } = await prisma.$transaction(async (tx) => {
       const previous = await tx.product.findFirst({
@@ -526,7 +607,7 @@ router.delete(
 
 router.put(
   "/products/bulk-sync",
-  requireRole("admin", "cashier"),
+  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const products = req.body.products || [];
     const productIds = products.map((item) => String(item.id));
@@ -577,13 +658,14 @@ router.put(
 router.get(
   "/sales/daily",
   asyncHandler(async (req, res) => {
+    const includeSensitive = isAdminUser(req.user);
     const sales = await prisma.sale.findMany({
       where: { status: "active", dateISO: toISODate() },
       include: saleInclude,
       orderBy: { createdAt: "desc" },
     });
 
-    res.json(sales.map(toSaleDto));
+    res.json(sales.map((sale) => toSaleDto(sale, { includeSensitive })));
   }),
 );
 
@@ -592,9 +674,17 @@ router.post(
   asyncHandler(async (req, res) => {
     const now = new Date();
     const items = req.body.items || [];
+    const openShift = await prisma.shift.findFirst({
+      where: { status: "open" },
+      select: { id: true },
+    });
 
     if (!items.length) {
       return res.status(400).json({ message: "Savat bo'sh" });
+    }
+
+    if (!openShift) {
+      return res.status(400).json({ message: "Avval kassani oching" });
     }
 
     if (!["cash", "card", "transfer"].includes(req.body.paymentMethod)) {
@@ -655,7 +745,12 @@ router.post(
               sku: item.sku,
               quantity: Number(item.quantity || 0),
               price: Number(item.price || item.sellPrice || 0),
-              costPrice: Number(item.costPrice || 0),
+              costPrice:
+                stockUpdates.find(
+                  (stockUpdate) =>
+                    String(stockUpdate.productId) ===
+                    String(item.productId || item.id),
+                )?.product.costPrice || 0,
               returnedQty: 0,
               returnStatus: "none",
             })),
@@ -718,7 +813,9 @@ router.post(
 
     void notifyNewSale(toSaleDto(sale));
 
-    res.status(201).json(toSaleDto(sale));
+    res.status(201).json(
+      toSaleDto(sale, { includeSensitive: isAdminUser(req.user) }),
+    );
   }),
 );
 
@@ -730,6 +827,10 @@ router.post(
       where: { status: "active", dateISO },
       include: saleInclude,
     });
+
+    if (!sales.length) {
+      return res.status(400).json({ message: "Yakunlanadigan savdolar yo'q" });
+    }
 
     const total = sales.reduce((acc, sale) => acc + Number(sale.total || 0) - Number(sale.returnedTotal || 0), 0);
     const returnedTotal = sales.reduce((acc, sale) => acc + Number(sale.returnedTotal || 0), 0);
@@ -772,7 +873,7 @@ router.post(
 router.get(
   "/sales/history",
   asyncHandler(async (req, res) => {
-    res.json(await buildHistory());
+    res.json(await buildHistory({ includeSensitive: isAdminUser(req.user) }));
   }),
 );
 
@@ -780,7 +881,11 @@ router.post(
   "/returns",
   asyncHandler(async (req, res) => {
     const { saleId, productId, quantity, reason } = req.body;
-    const qty = Number(quantity || req.body.returnedQty || 0);
+    const qty = Math.floor(Number(quantity || req.body.returnedQty || 0));
+
+    if (!String(reason || "").trim()) {
+      return res.status(400).json({ message: "Vozvrat sababi kiritilishi kerak" });
+    }
 
     const result = await prisma.$transaction(async (tx) => {
       const sale = await tx.sale.findUnique({
@@ -825,13 +930,22 @@ router.post(
         },
       });
 
-      await tx.saleItem.update({
-        where: { id: saleItem.id },
+      const saleItemUpdate = await tx.saleItem.updateMany({
+        where: {
+          id: saleItem.id,
+          returnedQty: { lte: saleItem.quantity - returnQty },
+        },
         data: {
           returnedQty: { increment: returnQty },
           returnStatus: returnQty === available ? "full" : "partial",
         },
       });
+
+      if (saleItemUpdate.count !== 1) {
+        throw Object.assign(new Error("Bu mahsulot allaqachon qaytarilgan"), {
+          status: 400,
+        });
+      }
 
       await tx.sale.update({
         where: { id: sale.id },
@@ -873,6 +987,7 @@ router.get(
 
 router.get(
   "/suppliers",
+  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const suppliers = await prisma.supplier.findMany({
       include: { transactions: { orderBy: { createdAt: "desc" } } },
@@ -1038,6 +1153,7 @@ router.post(
 
 router.get(
   "/expenses",
+  requireRole("admin"),
   asyncHandler(async (req, res) => {
     res.json(await prisma.expense.findMany({ orderBy: { createdAt: "desc" } }));
   }),
@@ -1085,6 +1201,14 @@ router.post(
   "/shifts/open",
   asyncHandler(async (req, res) => {
     const now = new Date();
+    const existingOpenShift = await prisma.shift.findFirst({
+      where: { status: "open" },
+    });
+
+    if (existingOpenShift) {
+      return res.status(400).json({ message: "Ochiq shift mavjud" });
+    }
+
     const shift = await prisma.shift.create({
       data: {
         cashierName: req.body.cashierName,
@@ -1110,6 +1234,9 @@ router.post(
   asyncHandler(async (req, res) => {
     const shift = await prisma.shift.findUnique({ where: { id: req.params.id } });
     if (!shift) return res.status(404).json({ message: "Shift topilmadi" });
+    if (shift.status !== "open") {
+      return res.status(400).json({ message: "Shift allaqachon yopilgan" });
+    }
 
     const sales = await prisma.sale.findMany({ where: { status: "active", dateISO: toISODate() } });
     const now = new Date();
@@ -1120,7 +1247,11 @@ router.post(
         closedById: req.user.id,
         closedByName: req.user.name,
         closingCash: Number(req.body.closingCash || 0),
-        totalSales: sales.reduce((acc, sale) => acc + Number(sale.total || 0), 0),
+        totalSales: sales.reduce(
+          (acc, sale) =>
+            acc + Number(sale.total || 0) - Number(sale.returnedTotal || 0),
+          0,
+        ),
         cashSales,
         cardSales: getPaymentTotal(sales, "card"),
         transferSales: getPaymentTotal(sales, "transfer"),
@@ -1162,7 +1293,7 @@ router.get(
     const [inventory, dailySales, salesHistory, expenses, returns, suppliers] = await Promise.all([
       prisma.product.findMany({ where: activeProductWhere }),
       prisma.sale.findMany({ where: { status: "active", dateISO: toISODate() }, include: saleInclude }),
-      buildHistory(),
+      buildHistory({ includeSensitive: true }),
       prisma.expense.findMany(),
       prisma.return.findMany(),
       prisma.supplier.findMany(),
@@ -1202,6 +1333,7 @@ router.post(
 
 router.post(
   "/telegram/events/:type",
+  requireRole("admin"),
   asyncHandler(async (req, res) => {
     res.json(await sendTelegramEvent(req.params.type, req.body));
   }),

@@ -68,11 +68,15 @@ model Product {
   debtAmount    Float    @default(0)
   supplierPhone String?
   date          String?
+  isDeleted     Boolean  @default(false)
+  deletedAt     DateTime?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @default(now()) @updatedAt
 
   saleItems SaleItem[]
   returns   Return[]
+
+  @@index([isDeleted])
 }
 
 model Sale {

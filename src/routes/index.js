@@ -27,6 +27,10 @@ const saleInclude = {
   items: true,
 };
 
+const activeProductWhere = {
+  isDeleted: false,
+};
+
 const getCanonicalQuantity = (product) => {
   const quantity = Number(product?.quantity ?? 0);
   const legacyStock = Number(product?.stock ?? 0);
@@ -238,7 +242,17 @@ router.post(
   asyncHandler(async (req, res) => {
     const { username, password } = req.body;
 
-    const user = await prisma.user.findUnique({ where: { username } });
+    const user = await prisma.user.findUnique({
+      where: { username },
+      select: {
+        id: true,
+        name: true,
+        username: true,
+        email: true,
+        password: true,
+        role: true,
+      },
+    });
 
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ message: "Login yoki parol noto'g'ri" });
@@ -248,9 +262,16 @@ router.post(
       expiresIn: "7d",
     });
 
-    const { password: _, ...safeUser } = user;
-
-    res.json({ token, user: safeUser });
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+      },
+    });
   }),
 );
 
@@ -268,6 +289,7 @@ router.get(
   "/bootstrap",
   asyncHandler(async (req, res) => {
     const todayISO = toISODate();
+    const includeHistory = req.query.includeHistory === "true";
 
     const [
       inventory,
@@ -280,7 +302,10 @@ router.get(
       activityLogs,
       telegramSettings,
     ] = await Promise.all([
-      prisma.product.findMany({ orderBy: { createdAt: "desc" } }),
+      prisma.product.findMany({
+        where: activeProductWhere,
+        orderBy: { createdAt: "desc" },
+      }),
       prisma.sale.findMany({
         where: { status: "active", dateISO: todayISO },
         include: saleInclude,
@@ -301,7 +326,7 @@ router.get(
     res.json({
       inventory: inventory.map(toProductDto),
       dailySales: dailySales.map(toSaleDto),
-      salesHistory: await buildHistory(),
+      salesHistory: includeHistory ? await buildHistory() : [],
       suppliers: suppliers.map(toSupplierDto),
       expenses,
       returns,
@@ -317,6 +342,7 @@ router.get(
   "/products",
   asyncHandler(async (req, res) => {
     const products = await prisma.product.findMany({
+      where: activeProductWhere,
       orderBy: { createdAt: "desc" },
     });
 
@@ -331,12 +357,36 @@ router.post(
     const productInput = normalizeProductInput(req.body);
 
     const { product, supplier } = await prisma.$transaction(async (tx) => {
-      const product = await tx.product.create({
-        data: {
-          ...(req.body.id ? { id: String(req.body.id) } : {}),
-          ...productInput,
-        },
-      });
+      const reviveFilters = [
+        req.body.id ? { id: String(req.body.id) } : null,
+        productInput.sku ? { sku: productInput.sku } : null,
+        productInput.barcode ? { barcode: productInput.barcode } : null,
+      ].filter(Boolean);
+
+      const deletedProduct = reviveFilters.length
+        ? await tx.product.findFirst({
+            where: {
+              isDeleted: true,
+              OR: reviveFilters,
+            },
+          })
+        : null;
+
+      const product = deletedProduct
+        ? await tx.product.update({
+            where: { id: deletedProduct.id },
+            data: {
+              ...productInput,
+              isDeleted: false,
+              deletedAt: null,
+            },
+          })
+        : await tx.product.create({
+            data: {
+              ...(req.body.id ? { id: String(req.body.id) } : {}),
+              ...productInput,
+            },
+          });
 
       const supplier = await applySupplierDebtChange(tx, {
         supplierName: productInput.supplier,
@@ -388,7 +438,9 @@ router.put(
     const productInput = normalizeProductInput(req.body);
 
     const { previous, product, supplier } = await prisma.$transaction(async (tx) => {
-      const previous = await tx.product.findUnique({ where: { id: req.params.id } });
+      const previous = await tx.product.findFirst({
+        where: { id: req.params.id, ...activeProductWhere },
+      });
 
       if (!previous) {
         throw Object.assign(new Error("Mahsulot topilmadi"), { status: 404 });
@@ -443,7 +495,21 @@ router.delete(
   "/products/:id",
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    const product = await prisma.product.delete({ where: { id: req.params.id } });
+    const existing = await prisma.product.findFirst({
+      where: { id: req.params.id, ...activeProductWhere },
+    });
+
+    if (!existing) {
+      throw Object.assign(new Error("Mahsulot topilmadi"), { status: 404 });
+    }
+
+    const product = await prisma.product.update({
+      where: { id: req.params.id },
+      data: {
+        isDeleted: true,
+        deletedAt: new Date(),
+      },
+    });
 
     await addActivityLog(
       {
@@ -454,7 +520,7 @@ router.delete(
       req.user,
     );
 
-    res.json(product);
+    res.json(toProductDto(product));
   }),
 );
 
@@ -465,28 +531,46 @@ router.put(
     const products = req.body.products || [];
     const productIds = products.map((item) => String(item.id));
 
-    const saved = await prisma.$transaction(
-      [
-        prisma.product.deleteMany({
-          where: {
-            id: { notIn: productIds },
-            saleItems: { none: {} },
+    if (!products.length) {
+      return res.json([]);
+    }
+
+    const syncOperations = [
+      ...products.map((item) =>
+        prisma.product.upsert({
+          where: { id: String(item.id) },
+          create: {
+            id: String(item.id),
+            ...normalizeProductInput(item),
+            isDeleted: false,
+            deletedAt: null,
+          },
+          update: {
+            ...normalizeProductInput(item),
+            isDeleted: false,
+            deletedAt: null,
           },
         }),
-        ...products.map((item) =>
-          prisma.product.upsert({
-            where: { id: String(item.id) },
-            create: {
-              id: String(item.id),
-              ...normalizeProductInput(item),
-            },
-            update: normalizeProductInput(item),
-          }),
-        ),
-      ],
+      ),
+    ];
+
+    syncOperations.unshift(
+      prisma.product.updateMany({
+        where: {
+          id: { notIn: productIds },
+          isDeleted: false,
+        },
+        data: {
+          isDeleted: true,
+          deletedAt: new Date(),
+        },
+      }),
     );
 
-    res.json(saved.slice(1).map(toProductDto));
+    const saved = await prisma.$transaction(syncOperations);
+    const syncedProducts = saved.slice(1);
+
+    res.json(syncedProducts.map(toProductDto));
   }),
 );
 
@@ -509,6 +593,14 @@ router.post(
     const now = new Date();
     const items = req.body.items || [];
 
+    if (!items.length) {
+      return res.status(400).json({ message: "Savat bo'sh" });
+    }
+
+    if (!["cash", "card", "transfer"].includes(req.body.paymentMethod)) {
+      return res.status(400).json({ message: "To'lov turi noto'g'ri" });
+    }
+
     const sale = await prisma.$transaction(async (tx) => {
       const stockUpdates = [];
 
@@ -519,7 +611,7 @@ router.post(
           where: { id: productId },
         });
 
-        if (!product) {
+        if (!product || product.isDeleted) {
           throw Object.assign(
             new Error(`${item.name || "Mahsulot"} topilmadi`),
             { status: 404 },
@@ -586,6 +678,7 @@ router.post(
         const decrementResult = await tx.product.updateMany({
           where: {
             id: stockUpdate.productId,
+            isDeleted: false,
             quantity: { gte: stockUpdate.requestedQty },
           },
           data: {
@@ -905,10 +998,9 @@ router.post(
         });
       }
 
-      const supplier = await tx.supplier.update({
+      await tx.supplier.update({
         where: { id: req.params.id },
         data: { paid: { increment: amount } },
-        include: { transactions: { orderBy: { createdAt: "desc" } } },
       });
 
       const transaction = await tx.supplierTransaction.create({
@@ -921,6 +1013,11 @@ router.post(
           time: req.body.time || toUzTime(),
           note: req.body.note,
         },
+      });
+
+      const supplier = await tx.supplier.findUnique({
+        where: { id: req.params.id },
+        include: { transactions: { orderBy: { createdAt: "desc" } } },
       });
 
       return { supplier: toSupplierDto(supplier), transaction };
@@ -1063,7 +1160,7 @@ router.get(
   requireRole("admin"),
   asyncHandler(async (req, res) => {
     const [inventory, dailySales, salesHistory, expenses, returns, suppliers] = await Promise.all([
-      prisma.product.findMany(),
+      prisma.product.findMany({ where: activeProductWhere }),
       prisma.sale.findMany({ where: { status: "active", dateISO: toISODate() }, include: saleInclude }),
       buildHistory(),
       prisma.expense.findMany(),

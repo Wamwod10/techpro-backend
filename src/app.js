@@ -3,10 +3,14 @@ import cors from "cors";
 import routes from "./routes/index.js";
 import { env } from "./config/env.js";
 
-const allowedOrigins = env.frontendUrl
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+const productionFrontendUrl = "https://techpro-beryl.vercel.app";
+const allowedOrigins = [
+  ...new Set(
+    [productionFrontendUrl, ...env.frontendUrl.split(",")]
+      .map((origin) => origin.trim())
+      .filter(Boolean),
+  ),
+];
 
 const app = express();
 

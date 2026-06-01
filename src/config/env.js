@@ -7,5 +7,9 @@ export const env = {
   nodeEnv: process.env.NODE_ENV || "development",
   databaseUrl: process.env.DATABASE_URL,
   jwtSecret: process.env.JWT_SECRET || "techpro-dev-secret-change-me",
-  frontendUrl: process.env.FRONTEND_URL || "http://localhost:5173",
+  frontendUrl:
+    process.env.FRONTEND_URL ||
+    (process.env.NODE_ENV === "production"
+      ? "https://techpro-beryl.vercel.app"
+      : "http://localhost:5173"),
 };

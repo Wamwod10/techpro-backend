@@ -1,9 +1,5 @@
 import { Router } from "express";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
 import { prisma } from "../config/prisma.js";
-import { env } from "../config/env.js";
-import { requireAuth, requireRole } from "../middlewares/auth.js";
 import { formatDuration, toISODate, toUzDate, toUzTime } from "../utils/datetime.js";
 import {
   getTelegramSettings,
@@ -32,6 +28,51 @@ const activeProductWhere = {
 };
 
 const isAdminUser = (user) => user?.role === "admin";
+
+const normalizeRole = (role) => (role === "admin" ? "admin" : "cashier");
+
+const getRequestUser = (req) => ({
+  id: null,
+  username:
+    req.headers["x-techpro-username"] ||
+    req.body?.username ||
+    req.body?.sellerUsername ||
+    null,
+  name:
+    req.headers["x-techpro-user-name"] ||
+    req.body?.userName ||
+    req.body?.sellerName ||
+    req.body?.openedByName ||
+    req.body?.closedBy ||
+    "Noma'lum foydalanuvchi",
+  role: normalizeRole(
+    req.headers["x-techpro-user-role"] ||
+      req.body?.userRole ||
+      req.body?.sellerRole,
+  ),
+});
+
+const attachRequestUser = async (req, res, next) => {
+  const requestUser = getRequestUser(req);
+
+  try {
+    const dbUser = requestUser.username
+      ? await prisma.user.findUnique({
+          where: { username: requestUser.username },
+          select: { id: true, name: true, username: true, role: true },
+        })
+      : null;
+
+    req.user = {
+      ...requestUser,
+      ...dbUser,
+      role: normalizeRole(dbUser?.role || requestUser.role),
+    };
+    next();
+  } catch (error) {
+    next(error);
+  }
+};
 
 const getCanonicalQuantity = (product) => {
   const quantity = Number(product?.quantity ?? 0);
@@ -302,53 +343,7 @@ const buildHistory = async ({ includeSensitive = true } = {}) => {
   }));
 };
 
-router.post(
-  "/auth/login",
-  asyncHandler(async (req, res) => {
-    const { username, password } = req.body;
-
-    const user = await prisma.user.findUnique({
-      where: { username },
-      select: {
-        id: true,
-        name: true,
-        username: true,
-        email: true,
-        password: true,
-        role: true,
-      },
-    });
-
-    if (!user || !(await bcrypt.compare(password, user.password))) {
-      return res.status(401).json({ message: "Login yoki parol noto'g'ri" });
-    }
-
-    const token = jwt.sign({ id: user.id, role: user.role }, env.jwtSecret, {
-      expiresIn: "7d",
-    });
-
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        name: user.name,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-      },
-    });
-  }),
-);
-
-router.get(
-  "/auth/me",
-  requireAuth,
-  asyncHandler(async (req, res) => {
-    res.json(req.user);
-  }),
-);
-
-router.use(requireAuth);
+router.use(attachRequestUser);
 
 router.get(
   "/bootstrap",
@@ -431,7 +426,6 @@ router.get(
 
 router.post(
   "/products",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const productInput = normalizeProductInput(req.body);
     validateProductInput(productInput);
@@ -513,7 +507,6 @@ router.post(
 
 router.put(
   "/products/:id",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const productInput = normalizeProductInput(req.body);
     validateProductInput(productInput);
@@ -574,7 +567,6 @@ router.put(
 
 router.delete(
   "/products/:id",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const existing = await prisma.product.findFirst({
       where: { id: req.params.id, ...activeProductWhere },
@@ -607,7 +599,6 @@ router.delete(
 
 router.put(
   "/products/bulk-sync",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const products = req.body.products || [];
     const productIds = products.map((item) => String(item.id));
@@ -987,7 +978,6 @@ router.get(
 
 router.get(
   "/suppliers",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const suppliers = await prisma.supplier.findMany({
       include: { transactions: { orderBy: { createdAt: "desc" } } },
@@ -1000,7 +990,6 @@ router.get(
 
 router.post(
   "/suppliers",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const input = normalizeSupplierInput(req.body);
 
@@ -1046,7 +1035,6 @@ router.post(
 
 router.put(
   "/suppliers/:id",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const supplier = await prisma.supplier.update({
       where: { id: req.params.id },
@@ -1060,7 +1048,6 @@ router.put(
 
 router.delete(
   "/suppliers/:id",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     res.json(await prisma.supplier.delete({ where: { id: req.params.id } }));
   }),
@@ -1068,7 +1055,6 @@ router.delete(
 
 router.post(
   "/suppliers/:id/transactions",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const transaction = await prisma.supplierTransaction.create({
       data: {
@@ -1090,7 +1076,6 @@ router.post(
 
 router.post(
   "/suppliers/:id/payments",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const amount = Number(req.body.amount || 0);
 
@@ -1153,7 +1138,6 @@ router.post(
 
 router.get(
   "/expenses",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     res.json(await prisma.expense.findMany({ orderBy: { createdAt: "desc" } }));
   }),
@@ -1161,7 +1145,6 @@ router.get(
 
 router.post(
   "/expenses",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     res.status(201).json(
       await prisma.expense.create({
@@ -1177,7 +1160,6 @@ router.post(
 
 router.delete(
   "/expenses/:id",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     res.json(await prisma.expense.delete({ where: { id: req.params.id } }));
   }),
@@ -1273,7 +1255,6 @@ router.post(
 
 router.get(
   "/activity-logs",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     res.json(await prisma.activityLog.findMany({ orderBy: { createdAt: "desc" }, take: 500 }));
   }),
@@ -1288,7 +1269,6 @@ router.post(
 
 router.get(
   "/dashboard/summary",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const [inventory, dailySales, salesHistory, expenses, returns, suppliers] = await Promise.all([
       prisma.product.findMany({ where: activeProductWhere }),
@@ -1305,7 +1285,6 @@ router.get(
 
 router.get(
   "/telegram/settings",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     res.json(await getTelegramSettings());
   }),
@@ -1313,7 +1292,6 @@ router.get(
 
 router.put(
   "/telegram/settings",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     res.json(await updateTelegramSettings(req.body));
   }),
@@ -1321,7 +1299,6 @@ router.put(
 
 router.post(
   "/telegram/test",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     res.json(
       await sendTelegramMessage(
@@ -1333,7 +1310,6 @@ router.post(
 
 router.post(
   "/telegram/events/:type",
-  requireRole("admin"),
   asyncHandler(async (req, res) => {
     res.json(await sendTelegramEvent(req.params.type, req.body));
   }),

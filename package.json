@@ -9,6 +9,8 @@
     "prisma:migrate": "prisma migrate deploy",
     "prisma:push": "prisma db push",
     "seed": "node prisma/seed.js",
+    "reset:data": "node prisma/resetData.js",
+    "reset-data": "npm run reset:data",
     "prisma:generate": "node node_modules/prisma/build/index.js generate"
   },
   "keywords": [],

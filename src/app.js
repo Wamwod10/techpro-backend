@@ -54,6 +54,7 @@ app.use((error, req, res, next) => {
   const prismaMessages = {
     P2002: "Bu ma'lumot bilan yozuv allaqachon mavjud",
     P2003: "Bu yozuv boshqa ma'lumotlarga bog'langan",
+    P2022: "Database migration apply qilinmagan. Render logida `npx prisma migrate deploy` ishlaganini tekshiring.",
     P2025: "Ma'lumot topilmadi",
   };
 

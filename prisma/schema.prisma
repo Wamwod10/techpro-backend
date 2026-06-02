@@ -170,6 +170,7 @@ model Supplier {
   name         String
   phone        String?
   address      String?
+  notes        String?
   debt         Float    @default(0)
   paid         Float    @default(0)
   deadline     String?

@@ -1,0 +1,1 @@
+ALTER TABLE "Supplier" ADD COLUMN IF NOT EXISTS "notes" TEXT;

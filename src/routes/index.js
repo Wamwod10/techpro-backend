@@ -136,13 +136,33 @@ const validateProductInput = (input) => {
 };
 
 const normalizeSupplierInput = (data) => ({
-  name: data.name || data.supplierName || "",
+  name: String(data.name || data.supplierName || "").trim(),
   phone: data.phone || data.supplierPhone || null,
   address: data.address || null,
-  debt: Number(data.debt || 0),
-  paid: Number(data.paid || 0),
-  deadline: data.deadline || null,
+  notes: data.notes || data.comment || null,
+  debt: Number(data.debt ?? data.totalDebt ?? 0),
+  paid: Number(data.paid ?? data.paidAmount ?? 0),
+  deadline: data.deadline || data.date || null,
 });
+
+const validateSupplierInput = (input) => {
+  if (!input.name) {
+    throw Object.assign(new Error("Supplier nomi kiritilishi kerak"), {
+      status: 400,
+    });
+  }
+
+  if (
+    Number.isNaN(input.debt) ||
+    Number.isNaN(input.paid) ||
+    input.debt < 0 ||
+    input.paid < 0
+  ) {
+    throw Object.assign(new Error("Supplier summalari manfiy bo'lishi mumkin emas"), {
+      status: 400,
+    });
+  }
+};
 
 const toSupplierDto = (supplier) => ({
   ...supplier,
@@ -993,9 +1013,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const input = normalizeSupplierInput(req.body);
 
-    if (!input.name.trim()) {
-      return res.status(400).json({ message: "Supplier nomi kiritilishi kerak" });
-    }
+    validateSupplierInput(input);
 
     const supplier = await prisma.$transaction(async (tx) => {
       const supplier = await tx.supplier.create({
@@ -1036,10 +1054,31 @@ router.post(
 router.put(
   "/suppliers/:id",
   asyncHandler(async (req, res) => {
-    const supplier = await prisma.supplier.update({
-      where: { id: req.params.id },
-      data: normalizeSupplierInput(req.body),
-      include: { transactions: { orderBy: { createdAt: "desc" } } },
+    if (!isAdminUser(req.user)) {
+      return res.status(403).json({ message: "Faqat admin tahrirlashi mumkin" });
+    }
+
+    const input = normalizeSupplierInput(req.body);
+    validateSupplierInput(input);
+
+    const supplier = await prisma.$transaction(async (tx) => {
+      const supplier = await tx.supplier.update({
+        where: { id: req.params.id },
+        data: input,
+        include: { transactions: { orderBy: { createdAt: "desc" } } },
+      });
+
+      await addActivityLog(
+        {
+          type: "supplier",
+          title: "Ta’minotchi ma’lumotlari o‘zgartirildi",
+          description: supplier.name,
+        },
+        req.user,
+        tx,
+      );
+
+      return supplier;
     });
 
     res.json(toSupplierDto(supplier));

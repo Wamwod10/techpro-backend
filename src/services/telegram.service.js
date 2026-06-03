@@ -69,12 +69,21 @@ export const sendTelegramMessage = async (message, eventType) => {
 
 const productList = (items = []) =>
   items
-    .map(
-      (item, index) =>
-        `${index + 1}. ${escapeHtml(item.name)} - ${Number(
-          item.quantity || 0,
-        )} dona x ${formatPrice(item.price || item.sellPrice || 0)}`,
-    )
+    .map((item, index) => {
+      const originalPrice = Number(
+        item.originalPrice ?? item.price ?? item.sellPrice ?? 0,
+      );
+      const finalPrice = Number(
+        item.finalPrice ?? item.price ?? item.sellPrice ?? 0,
+      );
+      const discount = Math.max(0, originalPrice - finalPrice);
+      const discountText =
+        discount > 0 ? ` (chegirma ${formatPrice(discount)} / dona)` : "";
+
+      return `${index + 1}. ${escapeHtml(item.name)} - ${Number(
+        item.quantity || 0,
+      )} dona x ${formatPrice(finalPrice)}${discountText}`;
+    })
     .join("\n");
 
 export const notifyNewSale = (sale) =>
@@ -83,6 +92,9 @@ export const notifyNewSale = (sale) =>
       "🛒 <b>Yangi savdo</b>",
       "",
       `👤 <b>Sotuvchi:</b> ${escapeHtml(sale.sellerName || "Noma'lum")}`,
+      ...(Number(sale.saleDiscountTotal || 0) > 0
+        ? [`<b>Chegirma:</b> ${formatPrice(sale.saleDiscountTotal)}`]
+        : []),
       `💰 <b>Summa:</b> ${formatPrice(sale.total)}`,
       `💳 <b>To'lov turi:</b> ${paymentLabels[sale.paymentMethod] || "Noma'lum"}`,
       `🕒 <b>Vaqt:</b> ${escapeHtml(sale.time || "")}`,

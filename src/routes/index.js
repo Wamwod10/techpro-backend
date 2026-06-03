@@ -293,20 +293,104 @@ const toProductDto = (product, { includeSensitive = true } = {}) => {
   return dto;
 };
 
-const toSaleDto = (sale, { includeSensitive = true } = {}) => ({
-  ...sale,
-  items: (sale.items || []).map((item) => {
-    if (includeSensitive) return item;
+const roundMoney = (value) => Math.round(Number(value || 0) * 100) / 100;
 
-    const { costPrice, ...safeItem } = item;
-    return safeItem;
-  }),
-});
+const getItemOriginalPrice = (item) =>
+  Number(item?.originalPrice ?? item?.price ?? item?.sellPrice ?? 0);
+
+const getItemFinalPrice = (item) =>
+  Number(item?.finalPrice ?? item?.price ?? item?.sellPrice ?? 0);
+
+const normalizeSalePricing = (sale) => {
+  const items = (sale.items || []).map((item) => {
+    const originalPrice = getItemOriginalPrice(item);
+    const finalPrice = getItemFinalPrice(item);
+
+    return {
+      ...item,
+      price: finalPrice,
+      originalPrice,
+      finalPrice,
+      itemDiscountPercent: Number(item.itemDiscountPercent || 0),
+      itemDiscountAmount: Number(item.itemDiscountAmount || 0),
+    };
+  });
+
+  const saleSubtotal = roundMoney(
+    items.reduce(
+      (acc, item) => acc + Number(item.originalPrice || 0) * Number(item.quantity || 0),
+      0,
+    ) || sale.saleSubtotal || sale.total || 0,
+  );
+  const saleDiscountTotal = roundMoney(
+    items.reduce(
+      (acc, item) =>
+        acc +
+        Math.max(0, Number(item.originalPrice || 0) - Number(item.finalPrice || 0)) *
+          Number(item.quantity || 0),
+      0,
+    ) || sale.saleDiscountTotal || 0,
+  );
+  const saleTotal = roundMoney(
+    Number(sale.saleTotal || 0) > 0
+      ? sale.saleTotal
+      : sale.total || saleSubtotal - saleDiscountTotal,
+  );
+
+  return {
+    ...sale,
+    items,
+    saleSubtotal,
+    saleDiscountTotal,
+    saleTotal,
+    total: Number(sale.total ?? saleTotal),
+  };
+};
+
+const toSaleDto = (sale, { includeSensitive = true } = {}) => {
+  const normalizedSale = normalizeSalePricing(sale);
+
+  return {
+    ...normalizedSale,
+    items: normalizedSale.items.map((item) => {
+      if (includeSensitive) return item;
+
+      const { costPrice, ...safeItem } = item;
+      return safeItem;
+    }),
+  };
+};
+
+const calculateSaleItemPricing = (item, product) => {
+  const originalPrice = roundMoney(product.sellPrice ?? product.price ?? item.originalPrice ?? item.price ?? 0);
+  const percent = Math.min(
+    100,
+    Math.max(0, Number(item.itemDiscountPercent || 0)),
+  );
+  const amount = Math.max(0, Number(item.itemDiscountAmount || 0));
+  const percentDiscount = roundMoney((originalPrice * percent) / 100);
+  const discountPerUnit = Math.min(originalPrice, roundMoney(percentDiscount + amount));
+  const finalPrice = roundMoney(originalPrice - discountPerUnit);
+
+  return {
+    originalPrice,
+    finalPrice,
+    itemDiscountPercent: percent,
+    itemDiscountAmount: roundMoney(amount),
+    discountPerUnit,
+    discountTotal: roundMoney(discountPerUnit * Number(item.quantity || 0)),
+  };
+};
+
+const getSaleGrossTotal = (sale) =>
+  (Number(sale.saleTotal || 0) > 0
+    ? Number(sale.saleTotal || 0)
+    : Number(sale.total || 0)) - Number(sale.returnedTotal || 0);
 
 const getPaymentTotal = (sales, paymentMethod) =>
   sales
     .filter((sale) => sale.paymentMethod === paymentMethod)
-    .reduce((acc, sale) => acc + Number(sale.total || 0) - Number(sale.returnedTotal || 0), 0);
+    .reduce((acc, sale) => acc + getSaleGrossTotal(sale), 0);
 
 const addActivityLog = async (data, user, client = prisma) => {
   const logData = {
@@ -704,6 +788,7 @@ router.post(
 
     const sale = await prisma.$transaction(async (tx) => {
       const stockUpdates = [];
+      const saleItems = [];
 
       for (const item of items) {
         const productId = String(item.productId || item.id);
@@ -730,41 +815,78 @@ router.post(
           );
         }
 
+        const pricing = calculateSaleItemPricing(
+          { ...item, quantity: requestedQty },
+          product,
+        );
+        const costPrice = Number(product.costPrice || 0);
+
+        if (pricing.finalPrice < costPrice && !isAdminUser(req.user)) {
+          throw Object.assign(
+            new Error(
+              `${product.name} tannarxdan past sotilishi mumkin emas`,
+            ),
+            { status: 403 },
+          );
+        }
+
         stockUpdates.push({
           product,
           productId,
           nextQuantity: currentStock - requestedQty,
           requestedQty,
         });
+
+        saleItems.push({
+          productId,
+          name: product.name,
+          sku: product.sku,
+          quantity: requestedQty,
+          price: pricing.finalPrice,
+          originalPrice: pricing.originalPrice,
+          finalPrice: pricing.finalPrice,
+          itemDiscountPercent: pricing.itemDiscountPercent,
+          itemDiscountAmount: pricing.itemDiscountAmount,
+          costPrice,
+          returnedQty: 0,
+          returnStatus: "none",
+        });
       }
+
+      const saleSubtotal = roundMoney(
+        saleItems.reduce(
+          (acc, item) => acc + Number(item.originalPrice || 0) * Number(item.quantity || 0),
+          0,
+        ),
+      );
+      const saleDiscountTotal = roundMoney(
+        saleItems.reduce(
+          (acc, item) =>
+            acc +
+            Math.max(0, Number(item.originalPrice || 0) - Number(item.finalPrice || 0)) *
+              Number(item.quantity || 0),
+          0,
+        ),
+      );
+      const saleTotal = roundMoney(saleSubtotal - saleDiscountTotal);
 
       const createdSale = await tx.sale.create({
         data: {
+          ...(req.body.id ? { id: String(req.body.id) } : {}),
           dateISO: req.body.dateISO || toISODate(now),
           date: req.body.date || toUzDate(now),
           time: req.body.time || toUzTime(now),
-          total: Number(req.body.total || 0),
+          total: saleTotal,
+          saleSubtotal,
+          saleDiscountTotal,
+          saleTotal,
           returnedTotal: 0,
           paymentMethod: req.body.paymentMethod,
           sellerId: req.user.id,
           sellerName: req.user.name,
           sellerRole: req.user.role,
           items: {
-            create: items.map((item) => ({
-              productId: String(item.productId || item.id),
-              name: item.name,
-              sku: item.sku,
-              quantity: Number(item.quantity || 0),
-              price: Number(item.price || item.sellPrice || 0),
-              costPrice:
-                stockUpdates.find(
-                  (stockUpdate) =>
-                    String(stockUpdate.productId) ===
-                    String(item.productId || item.id),
-                )?.product.costPrice || 0,
-              returnedQty: 0,
-              returnStatus: "none",
-            })),
+            create: saleItems,
           },
         },
         include: saleInclude,
@@ -843,7 +965,7 @@ router.post(
       return res.status(400).json({ message: "Yakunlanadigan savdolar yo'q" });
     }
 
-    const total = sales.reduce((acc, sale) => acc + Number(sale.total || 0) - Number(sale.returnedTotal || 0), 0);
+    const total = sales.reduce((acc, sale) => acc + getSaleGrossTotal(sale), 0);
     const returnedTotal = sales.reduce((acc, sale) => acc + Number(sale.returnedTotal || 0), 0);
 
     const report = await prisma.salesDay.upsert({
@@ -919,7 +1041,7 @@ router.post(
         throw Object.assign(new Error("Qaytarish mumkin bo'lgan miqdor yo'q"), { status: 400 });
       }
 
-      const amount = returnQty * Number(saleItem.price || 0);
+      const amount = returnQty * getItemFinalPrice(saleItem);
 
       const returnItem = await tx.return.create({
         data: {
@@ -1269,8 +1391,7 @@ router.post(
         closedByName: req.user.name,
         closingCash: Number(req.body.closingCash || 0),
         totalSales: sales.reduce(
-          (acc, sale) =>
-            acc + Number(sale.total || 0) - Number(sale.returnedTotal || 0),
+          (acc, sale) => acc + getSaleGrossTotal(sale),
           0,
         ),
         cashSales,

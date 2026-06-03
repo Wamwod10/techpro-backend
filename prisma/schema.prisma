@@ -85,6 +85,9 @@ model Sale {
   date          String
   time          String
   total         Float
+  saleSubtotal  Float         @default(0)
+  saleDiscountTotal Float     @default(0)
+  saleTotal     Float         @default(0)
   returnedTotal Float         @default(0)
   paymentMethod PaymentMethod
   status        SaleStatus    @default(active)
@@ -110,6 +113,10 @@ model SaleItem {
   sku          String?
   quantity     Int
   price        Float
+  originalPrice Float  @default(0)
+  finalPrice    Float  @default(0)
+  itemDiscountPercent Float @default(0)
+  itemDiscountAmount  Float @default(0)
   costPrice    Float   @default(0)
   returnedQty  Int     @default(0)
   returnStatus String  @default("none")

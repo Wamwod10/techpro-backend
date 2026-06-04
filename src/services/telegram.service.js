@@ -2,6 +2,7 @@ import { prisma } from "../config/prisma.js";
 import { escapeHtml, formatPrice, paymentLabels } from "../utils/format.js";
 
 const settingsId = "singleton";
+const LOW_STOCK_THRESHOLD = 3;
 
 export const defaultTelegramSettings = {
   botToken: "",
@@ -167,7 +168,11 @@ export const notifyStockChange = async (previousQty, product) => {
     return;
   }
 
-  if (Number(previousQty) > 5 && nextQty > 0 && nextQty <= 5) {
+  if (
+    Number(previousQty) > LOW_STOCK_THRESHOLD &&
+    nextQty > 0 &&
+    nextQty <= LOW_STOCK_THRESHOLD
+  ) {
     await notifyLowStock(product);
   }
 };

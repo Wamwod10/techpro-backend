@@ -27,6 +27,8 @@ const activeProductWhere = {
   isDeleted: false,
 };
 
+const LOW_STOCK_THRESHOLD = 3;
+
 const isAdminUser = (user) => user?.role === "admin";
 
 const normalizeRole = (role) => (role === "admin" ? "admin" : "cashier");
@@ -383,14 +385,80 @@ const calculateSaleItemPricing = (item, product) => {
 };
 
 const getSaleGrossTotal = (sale) =>
-  (Number(sale.saleTotal || 0) > 0
-    ? Number(sale.saleTotal || 0)
-    : Number(sale.total || 0)) - Number(sale.returnedTotal || 0);
+  Math.max(
+    0,
+    (Number(sale.saleTotal || 0) > 0
+      ? Number(sale.saleTotal || 0)
+      : Number(sale.total || 0)) - Number(sale.returnedTotal || 0),
+  );
 
 const getPaymentTotal = (sales, paymentMethod) =>
   sales
     .filter((sale) => sale.paymentMethod === paymentMethod)
     .reduce((acc, sale) => acc + getSaleGrossTotal(sale), 0);
+
+const summarizeSales = (sales = []) => ({
+  totalSales: roundMoney(
+    sales.reduce((acc, sale) => acc + getSaleGrossTotal(sale), 0),
+  ),
+  cashSales: roundMoney(getPaymentTotal(sales, "cash")),
+  cardSales: roundMoney(getPaymentTotal(sales, "card")),
+  transferSales: roundMoney(getPaymentTotal(sales, "transfer")),
+  transactions: sales.length,
+});
+
+const getShiftSalesWhere = (shift, closedAtISO) => ({
+  OR: [
+    { shiftId: shift.id },
+    {
+      shiftId: null,
+      createdAt: {
+        gte: shift.openedAtISO,
+        lte: closedAtISO,
+      },
+    },
+  ],
+});
+
+const generateQuickSku = (index) =>
+  `TP-${Date.now().toString(36).toUpperCase()}-${String(index + 1).padStart(3, "0")}`;
+
+const normalizeQuickEntry = (data) => {
+  const rows = Array.isArray(data.items) ? data.items : [];
+  const paymentStatus = normalizePaymentStatus(data.paymentStatus);
+
+  return {
+    entryNo: data.entryNo || `IN-${String(Date.now()).slice(-6).padStart(6, "0")}`,
+    supplierName: String(data.supplier || data.supplierName || "").trim(),
+    supplierPhone: data.supplierPhone || "",
+    date: data.date || toISODate(),
+    paymentStatus,
+    items: rows
+      .map((item, index) => {
+        const quantity = Math.max(0, Math.floor(Number(item.quantity || 0)));
+        const costPrice = Number(item.costPrice || 0);
+        const sellPrice = Number(item.sellPrice ?? item.price ?? 0);
+
+        return {
+          name: String(item.name || "").trim(),
+          sku: String(item.sku || "").trim() || generateQuickSku(index),
+          category: String(item.category || "Boshqa").trim() || "Boshqa",
+          quantity,
+          stock: quantity,
+          costPrice,
+          sellPrice,
+          price: sellPrice,
+          supplier: String(data.supplier || data.supplierName || "").trim(),
+          supplierPhone: data.supplierPhone || "",
+          paymentStatus,
+          debtAmount: isCreditPayment(paymentStatus) ? quantity * costPrice : 0,
+          date: data.date || toISODate(),
+          duplicateAction: item.duplicateAction === "new" ? "new" : "merge",
+        };
+      })
+      .filter((item) => item.name && item.quantity > 0),
+  };
+};
 
 const addActivityLog = async (data, user, client = prisma) => {
   const logData = {
@@ -603,9 +671,159 @@ router.post(
     });
 
     if (product.quantity === 0) void sendTelegramEvent("outOfStock", product);
-    if (product.quantity > 0 && product.quantity <= 5) void sendTelegramEvent("lowStock", product);
+    if (product.quantity > 0 && product.quantity <= LOW_STOCK_THRESHOLD) {
+      void sendTelegramEvent("lowStock", product);
+    }
 
     res.status(201).json({ product: toProductDto(product), supplier: supplier ? toSupplierDto(supplier) : null });
+  }),
+);
+
+router.post(
+  "/inventory/quick-entry",
+  asyncHandler(async (req, res) => {
+    const entry = normalizeQuickEntry(req.body);
+
+    if (!entry.items.length) {
+      return res.status(400).json({ message: "Kamida bitta mahsulot kiriting" });
+    }
+
+    if (!entry.supplierName) {
+      return res.status(400).json({ message: "Ta'minotchi kiritilishi kerak" });
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      const products = [];
+      const suppliers = [];
+      const warnings = [];
+      const totalDebt = entry.items.reduce(
+        (acc, item) => acc + Number(item.debtAmount || 0),
+        0,
+      );
+
+      for (const item of entry.items) {
+        validateProductInput(item);
+
+        const existingByName = await tx.product.findFirst({
+          where: {
+            ...activeProductWhere,
+            name: {
+              equals: item.name,
+              mode: "insensitive",
+            },
+          },
+        });
+
+        const shouldMerge = existingByName && item.duplicateAction !== "new";
+
+        if (shouldMerge) {
+          const product = await tx.product.update({
+            where: { id: existingByName.id },
+            data: {
+              quantity: { increment: item.quantity },
+              stock: { increment: item.quantity },
+              category: item.category || existingByName.category,
+              costPrice: item.costPrice,
+              sellPrice: item.sellPrice,
+              price: item.sellPrice,
+              supplier: entry.supplierName,
+              supplierPhone: entry.supplierPhone,
+              paymentStatus: item.paymentStatus,
+              date: entry.date,
+            },
+          });
+
+          products.push(product);
+          warnings.push({
+            productId: product.id,
+            name: product.name,
+            action: "merged",
+          });
+          continue;
+        }
+
+        const product = await tx.product.create({
+          data: {
+            name: item.name,
+            sku: item.sku,
+            category: item.category,
+            quantity: item.quantity,
+            stock: item.quantity,
+            costPrice: item.costPrice,
+            sellPrice: item.sellPrice,
+            price: item.sellPrice,
+            supplier: entry.supplierName,
+            supplierPhone: entry.supplierPhone,
+            paymentStatus: item.paymentStatus,
+            debtAmount: item.debtAmount,
+            date: entry.date,
+          },
+        });
+
+        products.push(product);
+
+        if (existingByName) {
+          warnings.push({
+            productId: product.id,
+            existingProductId: existingByName.id,
+            name: product.name,
+            action: "created_new_sku",
+          });
+        }
+      }
+
+      const supplier =
+        totalDebt > 0
+          ? await applySupplierDebtChange(tx, {
+              supplierName: entry.supplierName,
+              supplierPhone: entry.supplierPhone,
+              amount: totalDebt,
+              productName: `${entry.entryNo} tezkor kirim`,
+              date: entry.date,
+              note: `${entry.items.length} turdagi mahsulot uchun supplier qarzi`,
+            })
+          : null;
+
+      if (supplier) suppliers.push(supplier);
+
+      await addActivityLog(
+        {
+          type: "inventory",
+          title: "Tezkor kirim qilindi",
+          description: `${entry.entryNo}: ${products.length} turdagi mahsulot kirim qilindi`,
+        },
+        req.user,
+        tx,
+      );
+
+      if (supplier) {
+        await addActivityLog(
+          {
+            type: "supplier",
+            title: "Supplier qarzi qo'shildi",
+            description: `${supplier.name} supplieriga ${totalDebt} qarz qo'shildi`,
+          },
+          req.user,
+          tx,
+        );
+      }
+
+      return { products, suppliers, warnings, entryNo: entry.entryNo };
+    });
+
+    for (const product of result.products) {
+      if (product.quantity === 0) void sendTelegramEvent("outOfStock", product);
+      if (product.quantity > 0 && product.quantity <= LOW_STOCK_THRESHOLD) {
+        void sendTelegramEvent("lowStock", product);
+      }
+    }
+
+    res.status(201).json({
+      entryNo: result.entryNo,
+      products: result.products.map(toProductDto),
+      suppliers: result.suppliers.map(toSupplierDto),
+      warnings: result.warnings,
+    });
   }),
 );
 
@@ -882,6 +1100,7 @@ router.post(
           saleTotal,
           returnedTotal: 0,
           paymentMethod: req.body.paymentMethod,
+          shiftId: openShift.id,
           sellerId: req.user.id,
           sellerName: req.user.name,
           sellerRole: req.user.role,
@@ -1381,23 +1600,23 @@ router.post(
       return res.status(400).json({ message: "Shift allaqachon yopilgan" });
     }
 
-    const sales = await prisma.sale.findMany({ where: { status: "active", dateISO: toISODate() } });
     const now = new Date();
-    const cashSales = getPaymentTotal(sales, "cash");
+    const sales = await prisma.sale.findMany({
+      where: getShiftSalesWhere(shift, now),
+    });
+    const shiftTotals = summarizeSales(sales);
+    const cashSales = shiftTotals.cashSales;
     const closedShift = await prisma.shift.update({
       where: { id: shift.id },
       data: {
         closedById: req.user.id,
         closedByName: req.user.name,
         closingCash: Number(req.body.closingCash || 0),
-        totalSales: sales.reduce(
-          (acc, sale) => acc + getSaleGrossTotal(sale),
-          0,
-        ),
+        totalSales: shiftTotals.totalSales,
         cashSales,
-        cardSales: getPaymentTotal(sales, "card"),
-        transferSales: getPaymentTotal(sales, "transfer"),
-        transactions: sales.length,
+        cardSales: shiftTotals.cardSales,
+        transferSales: shiftTotals.transferSales,
+        transactions: shiftTotals.transactions,
         cashDifference: Number(req.body.closingCash || 0) - (Number(shift.openingCash || 0) + cashSales),
         closedAt: toUzTime(now),
         closedAtISO: now,

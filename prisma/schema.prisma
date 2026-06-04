@@ -92,17 +92,20 @@ model Sale {
   paymentMethod PaymentMethod
   status        SaleStatus    @default(active)
   sellerId      String?
+  shiftId       String?
   sellerName    String?
   sellerRole    String?
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @default(now()) @updatedAt
 
   seller  User?      @relation(fields: [sellerId], references: [id])
+  shift   Shift?     @relation(fields: [shiftId], references: [id])
   items   SaleItem[]
   returns Return[]
 
   @@index([status, dateISO])
   @@index([sellerId])
+  @@index([shiftId])
 }
 
 model SaleItem {
@@ -243,6 +246,7 @@ model Shift {
 
   openedBy User? @relation("ShiftOpenedBy", fields: [openedById], references: [id])
   closedBy User? @relation("ShiftClosedBy", fields: [closedById], references: [id])
+  sales    Sale[]
 
   @@index([status])
   @@index([closedAtISO])

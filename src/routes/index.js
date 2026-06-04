@@ -428,7 +428,6 @@ const normalizeQuickEntry = (data) => {
   const paymentStatus = normalizePaymentStatus(data.paymentStatus);
 
   return {
-    entryNo: data.entryNo || `IN-${String(Date.now()).slice(-6).padStart(6, "0")}`,
     supplierName: String(data.supplier || data.supplierName || "").trim(),
     supplierPhone: data.supplierPhone || "",
     date: data.date || toISODate(),
@@ -778,7 +777,7 @@ router.post(
               supplierName: entry.supplierName,
               supplierPhone: entry.supplierPhone,
               amount: totalDebt,
-              productName: `${entry.entryNo} tezkor kirim`,
+              productName: "Tezkor kirim",
               date: entry.date,
               note: `${entry.items.length} turdagi mahsulot uchun supplier qarzi`,
             })
@@ -790,7 +789,7 @@ router.post(
         {
           type: "inventory",
           title: "Tezkor kirim qilindi",
-          description: `${entry.entryNo}: ${products.length} turdagi mahsulot kirim qilindi`,
+          description: `${products.length} turdagi mahsulot kirim qilindi`,
         },
         req.user,
         tx,
@@ -808,7 +807,7 @@ router.post(
         );
       }
 
-      return { products, suppliers, warnings, entryNo: entry.entryNo };
+      return { products, suppliers, warnings };
     });
 
     for (const product of result.products) {
@@ -819,7 +818,6 @@ router.post(
     }
 
     res.status(201).json({
-      entryNo: result.entryNo,
       products: result.products.map(toProductDto),
       suppliers: result.suppliers.map(toSupplierDto),
       warnings: result.warnings,

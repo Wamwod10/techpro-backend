@@ -565,17 +565,30 @@ const buildHistory = async ({ storeId, includeSensitive = true } = {}) => {
     orderBy: { dateISO: "desc" },
   });
 
+  if (!days.length) {
+    return [];
+  }
+
   const sales = await prisma.sale.findMany({
-    where: { storeId, status: "closed" },
+    where: {
+      storeId,
+      status: "closed",
+      dateISO: { in: days.map((day) => day.dateISO) },
+    },
     include: saleInclude,
     orderBy: { createdAt: "desc" },
   });
+  const salesByDate = new Map();
+
+  for (const sale of sales) {
+    const dateSales = salesByDate.get(sale.dateISO) || [];
+    dateSales.push(toSaleDto(sale, { includeSensitive }));
+    salesByDate.set(sale.dateISO, dateSales);
+  }
 
   return days.map((day) => ({
     ...day,
-    sales: sales
-      .filter((sale) => sale.dateISO === day.dateISO)
-      .map((sale) => toSaleDto(sale, { includeSensitive })),
+    sales: salesByDate.get(day.dateISO) || [],
   }));
 };
 
@@ -586,8 +599,12 @@ router.get(
   asyncHandler(async (req, res) => {
     const todayISO = toISODate();
     const includeHistory = req.query.includeHistory === "true";
+    const includeBackground = req.query.includeBackground !== "false";
     const includeSensitive = isAdminUser(req.user);
-    const stores = await prisma.store.findMany({ orderBy: { createdAt: "asc" } });
+    const stores = await prisma.store.findMany({
+      orderBy: { createdAt: "asc" },
+      select: { id: true, name: true },
+    });
 
     const [
       inventory,
@@ -609,23 +626,27 @@ router.get(
         include: saleInclude,
         orderBy: { createdAt: "desc" },
       }),
-      includeSensitive
+      includeSensitive && includeBackground
         ? prisma.supplier.findMany({
             where: getStoreWhere(req),
             include: { transactions: { orderBy: { createdAt: "desc" } } },
             orderBy: { createdAt: "desc" },
           })
         : Promise.resolve([]),
-      includeSensitive
+      includeSensitive && includeBackground
         ? prisma.expense.findMany({ where: getStoreWhere(req), orderBy: { createdAt: "desc" } })
         : Promise.resolve([]),
-      prisma.return.findMany({ where: getStoreWhere(req), orderBy: { createdAt: "desc" } }),
+      includeBackground
+        ? prisma.return.findMany({ where: getStoreWhere(req), orderBy: { createdAt: "desc" } })
+        : Promise.resolve([]),
       prisma.shift.findFirst({ where: getStoreWhere(req, { status: "open" }), orderBy: { createdAt: "desc" } }),
-      prisma.shift.findMany({ where: getStoreWhere(req, { status: "closed" }), orderBy: { closedAtISO: "desc" } }),
-      includeSensitive
+      includeBackground
+        ? prisma.shift.findMany({ where: getStoreWhere(req, { status: "closed" }), orderBy: { closedAtISO: "desc" } })
+        : Promise.resolve([]),
+      includeSensitive && includeBackground
         ? prisma.activityLog.findMany({ where: getStoreWhere(req), orderBy: { createdAt: "desc" }, take: 500 })
         : Promise.resolve([]),
-      includeSensitive ? getTelegramSettings(req.storeId) : Promise.resolve(null),
+      includeSensitive && includeBackground ? getTelegramSettings(req.storeId) : Promise.resolve(null),
     ]);
 
     res.json({
@@ -1807,16 +1828,74 @@ router.post(
 router.get(
   "/dashboard/summary",
   asyncHandler(async (req, res) => {
-    const [inventory, dailySales, salesHistory, expenses, returns, suppliers] = await Promise.all([
-      prisma.product.findMany({ where: getActiveProductWhere(req) }),
-      prisma.sale.findMany({ where: getStoreWhere(req, { status: "active", dateISO: toISODate() }), include: saleInclude }),
-      buildHistory({ storeId: req.storeId, includeSensitive: true }),
-      prisma.expense.findMany({ where: getStoreWhere(req) }),
-      prisma.return.findMany({ where: getStoreWhere(req) }),
-      prisma.supplier.findMany({ where: getStoreWhere(req) }),
+    const includeHistory = req.query.includeHistory === "true";
+    const todayISO = toISODate();
+    const [
+      inventory,
+      dailySales,
+      salesDays,
+      expensesTotal,
+      returnsTotal,
+      supplierDebt,
+      productCount,
+      lowStockCount,
+    ] = await Promise.all([
+      prisma.product.findMany({
+        where: getActiveProductWhere(req),
+        orderBy: { createdAt: "desc" },
+      }),
+      prisma.sale.findMany({
+        where: getStoreWhere(req, { status: "active", dateISO: todayISO }),
+        include: saleInclude,
+        orderBy: { createdAt: "desc" },
+      }),
+      includeHistory
+        ? buildHistory({ storeId: req.storeId, includeSensitive: true })
+        : prisma.salesDay.findMany({
+            where: { storeId: req.storeId },
+            orderBy: { dateISO: "desc" },
+            take: 30,
+          }),
+      prisma.expense.aggregate({
+        where: getStoreWhere(req),
+        _sum: { amount: true },
+      }),
+      prisma.return.aggregate({
+        where: getStoreWhere(req),
+        _sum: { amount: true, quantity: true },
+        _count: { id: true },
+      }),
+      prisma.supplier.aggregate({
+        where: getStoreWhere(req),
+        _sum: { debt: true, paid: true },
+      }),
+      prisma.product.count({ where: getActiveProductWhere(req) }),
+      prisma.product.count({
+        where: getActiveProductWhere(req, {
+          quantity: { gt: 0, lte: LOW_STOCK_THRESHOLD },
+        }),
+      }),
     ]);
 
-    res.json({ inventory, dailySales, salesHistory, expenses, returns, suppliers });
+    res.json({
+      inventory,
+      dailySales: dailySales.map((sale) =>
+        toSaleDto(sale, { includeSensitive: true }),
+      ),
+      salesHistory: includeHistory
+        ? salesDays
+        : salesDays.map((day) => ({ ...day, sales: [] })),
+      expensesTotal: expensesTotal._sum.amount || 0,
+      returnsTotal: returnsTotal._sum.amount || 0,
+      returnsCount: returnsTotal._count.id || 0,
+      returnedQuantity: returnsTotal._sum.quantity || 0,
+      supplierDebt: Math.max(
+        0,
+        Number(supplierDebt._sum.debt || 0) - Number(supplierDebt._sum.paid || 0),
+      ),
+      productCount,
+      lowStockCount,
+    });
   }),
 );
 

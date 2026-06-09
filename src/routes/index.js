@@ -1,4 +1,4 @@
-import { Router } from "express";
+﻿import { Router } from "express";
 import { prisma } from "../config/prisma.js";
 import { formatDuration, toISODate, toUzDate, toUzTime } from "../utils/datetime.js";
 import {
@@ -27,6 +27,11 @@ const activeProductWhere = {
   isDeleted: false,
 };
 
+const DEFAULT_STORE_ID = "dokon-1";
+const DEFAULT_STORES = [
+  { id: "dokon-1", name: "dokon-1" },
+  { id: "dokon-2", name: "dokon-2" },
+];
 const LOW_STOCK_THRESHOLD = 3;
 
 const isAdminUser = (user) => user?.role === "admin";
@@ -54,27 +59,79 @@ const getRequestUser = (req) => ({
   ),
 });
 
+let defaultStoresPromise;
+
+const ensureDefaultStores = () => {
+  if (!defaultStoresPromise) {
+    defaultStoresPromise = Promise.all(
+      DEFAULT_STORES.map((store) =>
+        prisma.store.upsert({
+          where: { id: store.id },
+          update: { name: store.name },
+          create: store,
+        }),
+      ),
+    );
+  }
+
+  return defaultStoresPromise;
+};
+
+const getRequestedStoreId = (req) =>
+  req.headers["x-techpro-store-id"] ||
+  req.query.storeId ||
+  req.body?.storeId ||
+  null;
+
 const attachRequestUser = async (req, res, next) => {
   const requestUser = getRequestUser(req);
 
   try {
+    await ensureDefaultStores();
+
     const dbUser = requestUser.username
       ? await prisma.user.findUnique({
           where: { username: requestUser.username },
-          select: { id: true, name: true, username: true, role: true },
+          select: { id: true, name: true, username: true, role: true, storeId: true },
         })
       : null;
 
-    req.user = {
+    const user = {
       ...requestUser,
       ...dbUser,
       role: normalizeRole(dbUser?.role || requestUser.role),
     };
+
+    let storeId = user.storeId || DEFAULT_STORE_ID;
+
+    if (isAdminUser(user)) {
+      storeId = getRequestedStoreId(req) || DEFAULT_STORE_ID;
+
+      const storeExists = await prisma.store.findUnique({
+        where: { id: storeId },
+        select: { id: true },
+      });
+
+      if (!storeExists) {
+        throw Object.assign(new Error("Do'kon topilmadi"), { status: 400 });
+      }
+    }
+
+    req.user = user;
+    req.storeId = storeId;
     next();
   } catch (error) {
     next(error);
   }
 };
+
+const getStoreWhere = (req, extra = {}) => ({
+  ...extra,
+  storeId: req.storeId,
+});
+
+const getActiveProductWhere = (req, extra = {}) =>
+  getStoreWhere(req, { ...activeProductWhere, ...extra });
 
 const getCanonicalQuantity = (product) => {
   const quantity = Number(product?.quantity ?? 0);
@@ -171,9 +228,10 @@ const toSupplierDto = (supplier) => ({
   orders: supplier.transactions || [],
 });
 
-const findSupplierByName = (client, name) =>
+const findSupplierByName = (client, name, storeId) =>
   client.supplier.findFirst({
     where: {
+      storeId,
       name: {
         equals: name,
         mode: "insensitive",
@@ -184,7 +242,7 @@ const findSupplierByName = (client, name) =>
 
 const applySupplierDebtChange = async (
   client,
-  { supplierName, supplierPhone, amount, productName, date, note },
+  { storeId, supplierName, supplierPhone, amount, productName, date, note },
 ) => {
   const cleanSupplierName = String(supplierName || "").trim();
   const debtAmount = Number(amount || 0);
@@ -193,12 +251,13 @@ const applySupplierDebtChange = async (
     return null;
   }
 
-  const existingSupplier = await findSupplierByName(client, cleanSupplierName);
+  const existingSupplier = await findSupplierByName(client, cleanSupplierName, storeId);
   const transactionStatus = debtAmount > 0 ? "Qarz" : "Tuzatish";
 
   if (!existingSupplier) {
     const supplier = await client.supplier.create({
       data: {
+        storeId,
         name: cleanSupplierName,
         phone: supplierPhone || null,
         debt: Math.max(0, debtAmount),
@@ -207,6 +266,7 @@ const applySupplierDebtChange = async (
         transactions: {
           create: {
             type: debtAmount > 0 ? "inventory" : "adjustment",
+            storeId,
             status: transactionStatus,
             productName,
             amount: Math.abs(debtAmount),
@@ -234,6 +294,7 @@ const applySupplierDebtChange = async (
       transactions: {
         create: {
           type: debtAmount > 0 ? "inventory" : "adjustment",
+          storeId,
           status: transactionStatus,
           productName,
           amount: Math.abs(debtAmount),
@@ -408,6 +469,7 @@ const summarizeSales = (sales = []) => ({
 });
 
 const getShiftSalesWhere = (shift, closedAtISO) => ({
+  storeId: shift.storeId,
   OR: [
     { shiftId: shift.id },
     {
@@ -459,8 +521,9 @@ const normalizeQuickEntry = (data) => {
   };
 };
 
-const addActivityLog = async (data, user, client = prisma) => {
+const addActivityLog = async (data, user, client = prisma, storeId = DEFAULT_STORE_ID) => {
   const logData = {
+    storeId,
     type: data.type || "general",
     title: data.title || "Amal bajarildi",
     description: data.description || "",
@@ -473,6 +536,7 @@ const addActivityLog = async (data, user, client = prisma) => {
 
   const duplicate = await client.activityLog.findFirst({
     where: {
+      storeId: logData.storeId,
       type: logData.type,
       title: logData.title,
       description: logData.description,
@@ -495,13 +559,14 @@ const addActivityLog = async (data, user, client = prisma) => {
   });
 };
 
-const buildHistory = async ({ includeSensitive = true } = {}) => {
+const buildHistory = async ({ storeId, includeSensitive = true } = {}) => {
   const days = await prisma.salesDay.findMany({
+    where: { storeId },
     orderBy: { dateISO: "desc" },
   });
 
   const sales = await prisma.sale.findMany({
-    where: { status: "closed" },
+    where: { storeId, status: "closed" },
     include: saleInclude,
     orderBy: { createdAt: "desc" },
   });
@@ -522,6 +587,7 @@ router.get(
     const todayISO = toISODate();
     const includeHistory = req.query.includeHistory === "true";
     const includeSensitive = isAdminUser(req.user);
+    const stores = await prisma.store.findMany({ orderBy: { createdAt: "asc" } });
 
     const [
       inventory,
@@ -535,40 +601,45 @@ router.get(
       telegramSettings,
     ] = await Promise.all([
       prisma.product.findMany({
-        where: activeProductWhere,
+        where: getActiveProductWhere(req),
         orderBy: { createdAt: "desc" },
       }),
       prisma.sale.findMany({
-        where: { status: "active", dateISO: todayISO },
+        where: getStoreWhere(req, { status: "active", dateISO: todayISO }),
         include: saleInclude,
         orderBy: { createdAt: "desc" },
       }),
       includeSensitive
         ? prisma.supplier.findMany({
+            where: getStoreWhere(req),
             include: { transactions: { orderBy: { createdAt: "desc" } } },
             orderBy: { createdAt: "desc" },
           })
         : Promise.resolve([]),
       includeSensitive
-        ? prisma.expense.findMany({ orderBy: { createdAt: "desc" } })
+        ? prisma.expense.findMany({ where: getStoreWhere(req), orderBy: { createdAt: "desc" } })
         : Promise.resolve([]),
-      prisma.return.findMany({ orderBy: { createdAt: "desc" } }),
-      prisma.shift.findFirst({ where: { status: "open" }, orderBy: { createdAt: "desc" } }),
-      prisma.shift.findMany({ where: { status: "closed" }, orderBy: { closedAtISO: "desc" } }),
+      prisma.return.findMany({ where: getStoreWhere(req), orderBy: { createdAt: "desc" } }),
+      prisma.shift.findFirst({ where: getStoreWhere(req, { status: "open" }), orderBy: { createdAt: "desc" } }),
+      prisma.shift.findMany({ where: getStoreWhere(req, { status: "closed" }), orderBy: { closedAtISO: "desc" } }),
       includeSensitive
-        ? prisma.activityLog.findMany({ orderBy: { createdAt: "desc" }, take: 500 })
+        ? prisma.activityLog.findMany({ where: getStoreWhere(req), orderBy: { createdAt: "desc" }, take: 500 })
         : Promise.resolve([]),
-      includeSensitive ? getTelegramSettings() : Promise.resolve(null),
+      includeSensitive ? getTelegramSettings(req.storeId) : Promise.resolve(null),
     ]);
 
     res.json({
+      stores,
+      currentStoreId: req.storeId,
       inventory: inventory.map((product) =>
         toProductDto(product, { includeSensitive }),
       ),
       dailySales: dailySales.map((sale) =>
         toSaleDto(sale, { includeSensitive }),
       ),
-      salesHistory: includeHistory ? await buildHistory({ includeSensitive }) : [],
+      salesHistory: includeHistory
+        ? await buildHistory({ storeId: req.storeId, includeSensitive })
+        : [],
       suppliers: suppliers.map(toSupplierDto),
       expenses,
       returns,
@@ -585,7 +656,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const includeSensitive = isAdminUser(req.user);
     const products = await prisma.product.findMany({
-      where: activeProductWhere,
+      where: getActiveProductWhere(req),
       orderBy: { createdAt: "desc" },
     });
 
@@ -611,6 +682,7 @@ router.post(
       const deletedProduct = reviveFilters.length
         ? await tx.product.findFirst({
             where: {
+              storeId: req.storeId,
               isDeleted: true,
               OR: reviveFilters,
             },
@@ -629,11 +701,13 @@ router.post(
         : await tx.product.create({
             data: {
               ...(req.body.id ? { id: String(req.body.id) } : {}),
+              storeId: req.storeId,
               ...productInput,
             },
           });
 
       const supplier = await applySupplierDebtChange(tx, {
+        storeId: req.storeId,
         supplierName: productInput.supplier,
         supplierPhone: productInput.supplierPhone,
         amount: isCreditPayment(productInput.paymentStatus)
@@ -652,6 +726,7 @@ router.post(
         },
         req.user,
         tx,
+        req.storeId,
       );
 
       if (supplier) {
@@ -663,15 +738,16 @@ router.post(
           },
           req.user,
           tx,
+          req.storeId,
         );
       }
 
       return { product, supplier };
     });
 
-    if (product.quantity === 0) void sendTelegramEvent("outOfStock", product);
+    if (product.quantity === 0) void sendTelegramEvent("outOfStock", product, req.storeId);
     if (product.quantity > 0 && product.quantity <= LOW_STOCK_THRESHOLD) {
-      void sendTelegramEvent("lowStock", product);
+      void sendTelegramEvent("lowStock", product, req.storeId);
     }
 
     res.status(201).json({ product: toProductDto(product), supplier: supplier ? toSupplierDto(supplier) : null });
@@ -705,7 +781,7 @@ router.post(
 
         const existingByName = await tx.product.findFirst({
           where: {
-            ...activeProductWhere,
+            ...getActiveProductWhere(req),
             name: {
               equals: item.name,
               mode: "insensitive",
@@ -743,6 +819,7 @@ router.post(
 
         const product = await tx.product.create({
           data: {
+            storeId: req.storeId,
             name: item.name,
             sku: item.sku,
             category: item.category,
@@ -774,6 +851,7 @@ router.post(
       const supplier =
         totalDebt > 0
           ? await applySupplierDebtChange(tx, {
+              storeId: req.storeId,
               supplierName: entry.supplierName,
               supplierPhone: entry.supplierPhone,
               amount: totalDebt,
@@ -793,6 +871,7 @@ router.post(
         },
         req.user,
         tx,
+        req.storeId,
       );
 
       if (supplier) {
@@ -804,6 +883,7 @@ router.post(
           },
           req.user,
           tx,
+          req.storeId,
         );
       }
 
@@ -811,9 +891,9 @@ router.post(
     });
 
     for (const product of result.products) {
-      if (product.quantity === 0) void sendTelegramEvent("outOfStock", product);
+      if (product.quantity === 0) void sendTelegramEvent("outOfStock", product, req.storeId);
       if (product.quantity > 0 && product.quantity <= LOW_STOCK_THRESHOLD) {
-        void sendTelegramEvent("lowStock", product);
+        void sendTelegramEvent("lowStock", product, req.storeId);
       }
     }
 
@@ -833,7 +913,7 @@ router.put(
 
     const { previous, product, supplier } = await prisma.$transaction(async (tx) => {
       const previous = await tx.product.findFirst({
-        where: { id: req.params.id, ...activeProductWhere },
+        where: getActiveProductWhere(req, { id: req.params.id }),
       });
 
       if (!previous) {
@@ -846,6 +926,7 @@ router.put(
       });
 
       const supplier = await applySupplierDebtChange(tx, {
+        storeId: req.storeId,
         supplierName: productInput.supplier,
         supplierPhone: productInput.supplierPhone,
         amount: getDebtAdjustment(previous, productInput),
@@ -862,6 +943,7 @@ router.put(
         },
         req.user,
         tx,
+        req.storeId,
       );
 
       if (supplier) {
@@ -873,13 +955,14 @@ router.put(
           },
           req.user,
           tx,
+          req.storeId,
         );
       }
 
       return { previous, product, supplier };
     });
 
-    if (previous) void notifyStockChange(previous.quantity, product);
+    if (previous) void notifyStockChange(previous.quantity, product, req.storeId);
 
     res.json({ product: toProductDto(product), supplier: supplier ? toSupplierDto(supplier) : null });
   }),
@@ -889,7 +972,7 @@ router.delete(
   "/products/:id",
   asyncHandler(async (req, res) => {
     const existing = await prisma.product.findFirst({
-      where: { id: req.params.id, ...activeProductWhere },
+      where: getActiveProductWhere(req, { id: req.params.id }),
     });
 
     if (!existing) {
@@ -911,6 +994,8 @@ router.delete(
         description: `${product.name} katalogdan o'chirildi`,
       },
       req.user,
+      prisma,
+      req.storeId,
     );
 
     res.json(toProductDto(product));
@@ -927,12 +1012,24 @@ router.put(
       return res.json([]);
     }
 
+    const foreignProductsCount = await prisma.product.count({
+      where: {
+        id: { in: productIds },
+        storeId: { not: req.storeId },
+      },
+    });
+
+    if (foreignProductsCount > 0) {
+      return res.status(403).json({ message: "Boshqa do'kon mahsulotlarini sync qilish mumkin emas" });
+    }
+
     const syncOperations = [
       ...products.map((item) =>
         prisma.product.upsert({
           where: { id: String(item.id) },
           create: {
             id: String(item.id),
+            storeId: req.storeId,
             ...normalizeProductInput(item),
             isDeleted: false,
             deletedAt: null,
@@ -949,6 +1046,7 @@ router.put(
     syncOperations.unshift(
       prisma.product.updateMany({
         where: {
+          storeId: req.storeId,
           id: { notIn: productIds },
           isDeleted: false,
         },
@@ -971,7 +1069,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const includeSensitive = isAdminUser(req.user);
     const sales = await prisma.sale.findMany({
-      where: { status: "active", dateISO: toISODate() },
+      where: getStoreWhere(req, { status: "active", dateISO: toISODate() }),
       include: saleInclude,
       orderBy: { createdAt: "desc" },
     });
@@ -986,7 +1084,7 @@ router.post(
     const now = new Date();
     const items = req.body.items || [];
     const openShift = await prisma.shift.findFirst({
-      where: { status: "open" },
+      where: getStoreWhere(req, { status: "open" }),
       select: { id: true },
     });
 
@@ -1009,11 +1107,11 @@ router.post(
       for (const item of items) {
         const productId = String(item.productId || item.id);
         const requestedQty = Number(item.quantity || 0);
-        const product = await tx.product.findUnique({
-          where: { id: productId },
+        const product = await tx.product.findFirst({
+          where: getActiveProductWhere(req, { id: productId }),
         });
 
-        if (!product || product.isDeleted) {
+        if (!product) {
           throw Object.assign(
             new Error(`${item.name || "Mahsulot"} topilmadi`),
             { status: 404 },
@@ -1089,6 +1187,7 @@ router.post(
       const createdSale = await tx.sale.create({
         data: {
           ...(req.body.id ? { id: String(req.body.id) } : {}),
+          storeId: req.storeId,
           dateISO: req.body.dateISO || toISODate(now),
           date: req.body.date || toUzDate(now),
           time: req.body.time || toUzTime(now),
@@ -1103,7 +1202,10 @@ router.post(
           sellerName: req.user.name,
           sellerRole: req.user.role,
           items: {
-            create: saleItems,
+            create: saleItems.map((item) => ({
+              ...item,
+              storeId: req.storeId,
+            })),
           },
         },
         include: saleInclude,
@@ -1123,6 +1225,7 @@ router.post(
         const decrementResult = await tx.product.updateMany({
           where: {
             id: stockUpdate.productId,
+            storeId: req.storeId,
             isDeleted: false,
             quantity: { gte: stockUpdate.requestedQty },
           },
@@ -1146,6 +1249,7 @@ router.post(
         void notifyStockChange(
           getCanonicalQuantity(stockUpdate.product),
           toProductDto(updated),
+          req.storeId,
         );
       }
 
@@ -1159,9 +1263,11 @@ router.post(
         description: `${sale.items.length} turdagi mahsulot sotildi`,
       },
       req.user,
+      prisma,
+      req.storeId,
     );
 
-    void notifyNewSale(toSaleDto(sale));
+    void notifyNewSale(toSaleDto(sale), req.storeId);
 
     res.status(201).json(
       toSaleDto(sale, { includeSensitive: isAdminUser(req.user) }),
@@ -1174,7 +1280,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const dateISO = req.body.dateISO || toISODate();
     const sales = await prisma.sale.findMany({
-      where: { status: "active", dateISO },
+      where: getStoreWhere(req, { status: "active", dateISO }),
       include: saleInclude,
     });
 
@@ -1186,8 +1292,9 @@ router.post(
     const returnedTotal = sales.reduce((acc, sale) => acc + Number(sale.returnedTotal || 0), 0);
 
     const report = await prisma.salesDay.upsert({
-      where: { dateISO },
+      where: { storeId_dateISO: { storeId: req.storeId, dateISO } },
       create: {
+        storeId: req.storeId,
         dateISO,
         date: req.body.date || toUzDate(),
         total,
@@ -1210,11 +1317,11 @@ router.post(
     });
 
     await prisma.sale.updateMany({
-      where: { status: "active", dateISO },
+      where: getStoreWhere(req, { status: "active", dateISO }),
       data: { status: "closed" },
     });
 
-    void notifyDailyReport(report);
+    void notifyDailyReport(report, req.storeId);
 
     res.json({ report, dailySales: [] });
   }),
@@ -1223,7 +1330,7 @@ router.post(
 router.get(
   "/sales/history",
   asyncHandler(async (req, res) => {
-    res.json(await buildHistory({ includeSensitive: isAdminUser(req.user) }));
+    res.json(await buildHistory({ storeId: req.storeId, includeSensitive: isAdminUser(req.user) }));
   }),
 );
 
@@ -1247,7 +1354,7 @@ router.post(
         sale?.items.find((item) => item.productId === String(productId)) ||
         sale?.items.find((item) => item.id === req.body.saleItemId);
 
-      if (!sale || !saleItem) {
+      if (!sale || sale.storeId !== req.storeId || !saleItem || saleItem.storeId !== req.storeId) {
         throw Object.assign(new Error("Savdo yoki mahsulot topilmadi"), { status: 404 });
       }
 
@@ -1262,6 +1369,7 @@ router.post(
 
       const returnItem = await tx.return.create({
         data: {
+          storeId: req.storeId,
           saleId: sale.id,
           saleItemId: saleItem.id,
           productId: saleItem.productId,
@@ -1283,6 +1391,7 @@ router.post(
       const saleItemUpdate = await tx.saleItem.updateMany({
         where: {
           id: saleItem.id,
+          storeId: req.storeId,
           returnedQty: { lte: saleItem.quantity - returnQty },
         },
         data: {
@@ -1320,9 +1429,11 @@ router.post(
         description: `${result.productName} vozvrat qilindi: ${result.quantity} dona`,
       },
       req.user,
+      prisma,
+      req.storeId,
     );
 
-    void notifyReturn(result);
+    void notifyReturn(result, req.storeId);
 
     res.status(201).json(result);
   }),
@@ -1331,7 +1442,7 @@ router.post(
 router.get(
   "/returns",
   asyncHandler(async (req, res) => {
-    res.json(await prisma.return.findMany({ orderBy: { createdAt: "desc" } }));
+    res.json(await prisma.return.findMany({ where: getStoreWhere(req), orderBy: { createdAt: "desc" } }));
   }),
 );
 
@@ -1339,6 +1450,7 @@ router.get(
   "/suppliers",
   asyncHandler(async (req, res) => {
     const suppliers = await prisma.supplier.findMany({
+      where: getStoreWhere(req),
       include: { transactions: { orderBy: { createdAt: "desc" } } },
       orderBy: { createdAt: "desc" },
     });
@@ -1358,13 +1470,15 @@ router.post(
       const supplier = await tx.supplier.create({
         data: {
           ...(req.body.id ? { id: String(req.body.id) } : {}),
+          storeId: req.storeId,
           ...input,
           transactions:
             input.debt > 0
               ? {
                   create: {
-                    type: "inventory",
-                    status: "Qarz",
+                  type: "inventory",
+                  storeId: req.storeId,
+                  status: "Qarz",
                     amount: input.debt,
                     phone: input.phone,
                     date: input.deadline || toUzDate(),
@@ -1381,6 +1495,7 @@ router.post(
         { type: "supplier", title: "Supplier qo'shildi", description: supplier.name },
         req.user,
         tx,
+        req.storeId,
       );
 
       return supplier;
@@ -1401,6 +1516,15 @@ router.put(
     validateSupplierInput(input);
 
     const supplier = await prisma.$transaction(async (tx) => {
+      const existingSupplier = await tx.supplier.findFirst({
+        where: getStoreWhere(req, { id: req.params.id }),
+        select: { id: true },
+      });
+
+      if (!existingSupplier) {
+        throw Object.assign(new Error("Supplier topilmadi"), { status: 404 });
+      }
+
       const supplier = await tx.supplier.update({
         where: { id: req.params.id },
         data: input,
@@ -1410,11 +1534,12 @@ router.put(
       await addActivityLog(
         {
           type: "supplier",
-          title: "Ta’minotchi ma’lumotlari o‘zgartirildi",
+          title: "TaвЂ™minotchi maвЂ™lumotlari oвЂzgartirildi",
           description: supplier.name,
         },
         req.user,
         tx,
+        req.storeId,
       );
 
       return supplier;
@@ -1427,6 +1552,15 @@ router.put(
 router.delete(
   "/suppliers/:id",
   asyncHandler(async (req, res) => {
+    const existingSupplier = await prisma.supplier.findFirst({
+      where: getStoreWhere(req, { id: req.params.id }),
+      select: { id: true },
+    });
+
+    if (!existingSupplier) {
+      throw Object.assign(new Error("Supplier topilmadi"), { status: 404 });
+    }
+
     res.json(await prisma.supplier.delete({ where: { id: req.params.id } }));
   }),
 );
@@ -1434,8 +1568,18 @@ router.delete(
 router.post(
   "/suppliers/:id/transactions",
   asyncHandler(async (req, res) => {
+    const supplier = await prisma.supplier.findFirst({
+      where: getStoreWhere(req, { id: req.params.id }),
+      select: { id: true },
+    });
+
+    if (!supplier) {
+      throw Object.assign(new Error("Supplier topilmadi"), { status: 404 });
+    }
+
     const transaction = await prisma.supplierTransaction.create({
       data: {
+        storeId: req.storeId,
         supplierId: req.params.id,
         type: req.body.type || "payment",
         status: req.body.status,
@@ -1462,7 +1606,9 @@ router.post(
     }
 
     const result = await prisma.$transaction(async (tx) => {
-      const current = await tx.supplier.findUnique({ where: { id: req.params.id } });
+      const current = await tx.supplier.findFirst({
+        where: getStoreWhere(req, { id: req.params.id }),
+      });
 
       if (!current) {
         throw Object.assign(new Error("Supplier topilmadi"), { status: 404 });
@@ -1483,6 +1629,7 @@ router.post(
 
       const transaction = await tx.supplierTransaction.create({
         data: {
+          storeId: req.storeId,
           supplierId: req.params.id,
           type: "payment",
           status: "To'lov",
@@ -1508,6 +1655,8 @@ router.post(
         description: `${result.supplier.name} supplieriga to'lov qilindi`,
       },
       req.user,
+      prisma,
+      req.storeId,
     );
 
     res.status(201).json(result);
@@ -1517,7 +1666,7 @@ router.post(
 router.get(
   "/expenses",
   asyncHandler(async (req, res) => {
-    res.json(await prisma.expense.findMany({ orderBy: { createdAt: "desc" } }));
+    res.json(await prisma.expense.findMany({ where: getStoreWhere(req), orderBy: { createdAt: "desc" } }));
   }),
 );
 
@@ -1528,6 +1677,7 @@ router.post(
       await prisma.expense.create({
         data: {
           ...req.body,
+          storeId: req.storeId,
           amount: Number(req.body.amount || 0),
           date: req.body.date || toUzDate(),
         },
@@ -1539,6 +1689,15 @@ router.post(
 router.delete(
   "/expenses/:id",
   asyncHandler(async (req, res) => {
+    const existingExpense = await prisma.expense.findFirst({
+      where: getStoreWhere(req, { id: req.params.id }),
+      select: { id: true },
+    });
+
+    if (!existingExpense) {
+      throw Object.assign(new Error("Xarajat topilmadi"), { status: 404 });
+    }
+
     res.json(await prisma.expense.delete({ where: { id: req.params.id } }));
   }),
 );
@@ -1546,14 +1705,14 @@ router.delete(
 router.get(
   "/shifts/active",
   asyncHandler(async (req, res) => {
-    res.json(await prisma.shift.findFirst({ where: { status: "open" }, orderBy: { createdAt: "desc" } }));
+    res.json(await prisma.shift.findFirst({ where: getStoreWhere(req, { status: "open" }), orderBy: { createdAt: "desc" } }));
   }),
 );
 
 router.get(
   "/shifts",
   asyncHandler(async (req, res) => {
-    res.json(await prisma.shift.findMany({ orderBy: { createdAt: "desc" } }));
+    res.json(await prisma.shift.findMany({ where: getStoreWhere(req), orderBy: { createdAt: "desc" } }));
   }),
 );
 
@@ -1562,7 +1721,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const now = new Date();
     const existingOpenShift = await prisma.shift.findFirst({
-      where: { status: "open" },
+      where: getStoreWhere(req, { status: "open" }),
     });
 
     if (existingOpenShift) {
@@ -1571,6 +1730,7 @@ router.post(
 
     const shift = await prisma.shift.create({
       data: {
+        storeId: req.storeId,
         cashierName: req.body.cashierName,
         openedById: req.user.id,
         openedByName: req.user.name,
@@ -1582,8 +1742,8 @@ router.post(
       },
     });
 
-    await addActivityLog({ type: "shift", title: "Shift ochildi", description: shift.cashierName }, req.user);
-    void notifyShiftOpen(shift);
+    await addActivityLog({ type: "shift", title: "Shift ochildi", description: shift.cashierName }, req.user, prisma, req.storeId);
+    void notifyShiftOpen(shift, req.storeId);
 
     res.status(201).json(shift);
   }),
@@ -1592,7 +1752,7 @@ router.post(
 router.post(
   "/shifts/:id/close",
   asyncHandler(async (req, res) => {
-    const shift = await prisma.shift.findUnique({ where: { id: req.params.id } });
+    const shift = await prisma.shift.findFirst({ where: getStoreWhere(req, { id: req.params.id }) });
     if (!shift) return res.status(404).json({ message: "Shift topilmadi" });
     if (shift.status !== "open") {
       return res.status(400).json({ message: "Shift allaqachon yopilgan" });
@@ -1623,8 +1783,8 @@ router.post(
       },
     });
 
-    await addActivityLog({ type: "shift", title: "Shift yopildi", description: closedShift.cashierName }, req.user);
-    void notifyShiftClose(closedShift);
+    await addActivityLog({ type: "shift", title: "Shift yopildi", description: closedShift.cashierName }, req.user, prisma, req.storeId);
+    void notifyShiftClose(closedShift, req.storeId);
 
     res.json(closedShift);
   }),
@@ -1633,14 +1793,14 @@ router.post(
 router.get(
   "/activity-logs",
   asyncHandler(async (req, res) => {
-    res.json(await prisma.activityLog.findMany({ orderBy: { createdAt: "desc" }, take: 500 }));
+    res.json(await prisma.activityLog.findMany({ where: getStoreWhere(req), orderBy: { createdAt: "desc" }, take: 500 }));
   }),
 );
 
 router.post(
   "/activity-logs",
   asyncHandler(async (req, res) => {
-    res.status(201).json(await addActivityLog(req.body, req.user));
+    res.status(201).json(await addActivityLog(req.body, req.user, prisma, req.storeId));
   }),
 );
 
@@ -1648,12 +1808,12 @@ router.get(
   "/dashboard/summary",
   asyncHandler(async (req, res) => {
     const [inventory, dailySales, salesHistory, expenses, returns, suppliers] = await Promise.all([
-      prisma.product.findMany({ where: activeProductWhere }),
-      prisma.sale.findMany({ where: { status: "active", dateISO: toISODate() }, include: saleInclude }),
-      buildHistory({ includeSensitive: true }),
-      prisma.expense.findMany(),
-      prisma.return.findMany(),
-      prisma.supplier.findMany(),
+      prisma.product.findMany({ where: getActiveProductWhere(req) }),
+      prisma.sale.findMany({ where: getStoreWhere(req, { status: "active", dateISO: toISODate() }), include: saleInclude }),
+      buildHistory({ storeId: req.storeId, includeSensitive: true }),
+      prisma.expense.findMany({ where: getStoreWhere(req) }),
+      prisma.return.findMany({ where: getStoreWhere(req) }),
+      prisma.supplier.findMany({ where: getStoreWhere(req) }),
     ]);
 
     res.json({ inventory, dailySales, salesHistory, expenses, returns, suppliers });
@@ -1663,14 +1823,14 @@ router.get(
 router.get(
   "/telegram/settings",
   asyncHandler(async (req, res) => {
-    res.json(await getTelegramSettings());
+    res.json(await getTelegramSettings(req.storeId));
   }),
 );
 
 router.put(
   "/telegram/settings",
   asyncHandler(async (req, res) => {
-    res.json(await updateTelegramSettings(req.body));
+    res.json(await updateTelegramSettings(req.body, req.storeId));
   }),
 );
 
@@ -1679,16 +1839,19 @@ router.post(
   asyncHandler(async (req, res) => {
     res.json(
       await sendTelegramMessage(
-        "✅ <b>TECHPRO Telegram test</b>\n\nTelegram bot muvaffaqiyatli ulandi.",
+        "TECHPRO Telegram test\n\nTelegram bot muvaffaqiyatli ulandi.",
+        undefined,
+        req.storeId,
       ),
     );
   }),
 );
 
+
 router.post(
   "/telegram/events/:type",
   asyncHandler(async (req, res) => {
-    res.json(await sendTelegramEvent(req.params.type, req.body));
+    res.json(await sendTelegramEvent(req.params.type, req.body, req.storeId));
   }),
 );
 

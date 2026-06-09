@@ -1,7 +1,7 @@
 import { prisma } from "../config/prisma.js";
 import { escapeHtml, formatPrice, paymentLabels } from "../utils/format.js";
 
-const settingsId = "singleton";
+const defaultStoreId = "dokon-1";
 const LOW_STOCK_THRESHOLD = 3;
 
 export const defaultTelegramSettings = {
@@ -28,26 +28,31 @@ const normalizeTelegramSettings = (data = {}) => ({
   shiftClose: Boolean(data.shiftClose),
 });
 
-export const getTelegramSettings = async () =>
+export const getTelegramSettings = async (storeId = defaultStoreId) =>
   prisma.telegramSettings.upsert({
-    where: { id: settingsId },
+    where: { storeId },
     update: {},
-    create: { id: settingsId, ...defaultTelegramSettings },
+    create: { id: `telegram-${storeId}`, storeId, ...defaultTelegramSettings },
   });
 
-export const updateTelegramSettings = async (data) =>
+export const updateTelegramSettings = async (data, storeId = defaultStoreId) =>
   prisma.telegramSettings.upsert({
-    where: { id: settingsId },
+    where: { storeId },
     create: {
-      id: settingsId,
+      id: `telegram-${storeId}`,
+      storeId,
       ...defaultTelegramSettings,
       ...normalizeTelegramSettings(data),
     },
     update: normalizeTelegramSettings(data),
   });
 
-export const sendTelegramMessage = async (message, eventType) => {
-  const settings = await getTelegramSettings();
+export const sendTelegramMessage = async (
+  message,
+  eventType,
+  storeId = defaultStoreId,
+) => {
+  const settings = await getTelegramSettings(storeId);
 
   if (!settings.botToken || !settings.chatId) return { skipped: true };
   if (eventType && settings[eventType] === false) return { skipped: true };
@@ -87,7 +92,7 @@ const productList = (items = []) =>
     })
     .join("\n");
 
-export const notifyNewSale = (sale) =>
+export const notifyNewSale = (sale, storeId) =>
   sendTelegramMessage(
     [
       "🛒 <b>Yangi savdo</b>",
@@ -104,9 +109,10 @@ export const notifyNewSale = (sale) =>
       productList(sale.items),
     ].join("\n"),
     "newSale",
+    storeId,
   );
 
-export const notifyDailyReport = (report) =>
+export const notifyDailyReport = (report, storeId) =>
   sendTelegramMessage(
     [
       "📊 <b>Kunlik hisobot</b>",
@@ -120,9 +126,10 @@ export const notifyDailyReport = (report) =>
       `👤 <b>Yakunlagan xodim:</b> ${escapeHtml(report.closedBy || "Noma'lum")}`,
     ].join("\n"),
     "dailyReport",
+    storeId,
   );
 
-export const notifyReturn = (returnItem) =>
+export const notifyReturn = (returnItem, storeId) =>
   sendTelegramMessage(
     [
       "↩️ <b>Vozvrat</b>",
@@ -134,9 +141,10 @@ export const notifyReturn = (returnItem) =>
       `👤 <b>Xodim:</b> ${escapeHtml(returnItem.sellerName || "Noma'lum")}`,
     ].join("\n"),
     "returns",
+    storeId,
   );
 
-export const notifyLowStock = (item) =>
+export const notifyLowStock = (item, storeId) =>
   sendTelegramMessage(
     [
       "⚠️ <b>Kam qolgan mahsulot</b>",
@@ -146,9 +154,10 @@ export const notifyLowStock = (item) =>
       `📉 <b>Qoldiq:</b> ${Number(item.quantity || 0)} dona`,
     ].join("\n"),
     "lowStock",
+    storeId,
   );
 
-export const notifyOutOfStock = (item) =>
+export const notifyOutOfStock = (item, storeId) =>
   sendTelegramMessage(
     [
       "🚫 <b>Mahsulot tugadi</b>",
@@ -158,13 +167,14 @@ export const notifyOutOfStock = (item) =>
       "📉 <b>Qoldiq:</b> 0 dona",
     ].join("\n"),
     "outOfStock",
+    storeId,
   );
 
-export const notifyStockChange = async (previousQty, product) => {
+export const notifyStockChange = async (previousQty, product, storeId) => {
   const nextQty = Number(product.quantity || 0);
 
   if (nextQty === 0 && previousQty !== 0) {
-    await notifyOutOfStock(product);
+    await notifyOutOfStock(product, storeId);
     return;
   }
 
@@ -173,11 +183,11 @@ export const notifyStockChange = async (previousQty, product) => {
     nextQty > 0 &&
     nextQty <= LOW_STOCK_THRESHOLD
   ) {
-    await notifyLowStock(product);
+    await notifyLowStock(product, storeId);
   }
 };
 
-export const notifyShiftOpen = (shift) =>
+export const notifyShiftOpen = (shift, storeId) =>
   sendTelegramMessage(
     [
       "🟢 <b>Shift ochildi</b>",
@@ -187,9 +197,10 @@ export const notifyShiftOpen = (shift) =>
       `🕒 <b>Vaqt:</b> ${escapeHtml(shift.openedAt)}`,
     ].join("\n"),
     "shiftOpen",
+    storeId,
   );
 
-export const notifyShiftClose = (shift) =>
+export const notifyShiftClose = (shift, storeId) =>
   sendTelegramMessage(
     [
       "🔴 <b>Shift yopildi</b>",
@@ -204,9 +215,10 @@ export const notifyShiftClose = (shift) =>
       `🕒 <b>Vaqt:</b> ${escapeHtml(shift.closedAt || "")}`,
     ].join("\n"),
     "shiftClose",
+    storeId,
   );
 
-export const sendTelegramEvent = (type, payload) => {
+export const sendTelegramEvent = (type, payload, storeId) => {
   const handlers = {
     newSale: notifyNewSale,
     dailyReport: notifyDailyReport,
@@ -217,5 +229,5 @@ export const sendTelegramEvent = (type, payload) => {
     shiftClose: notifyShiftClose,
   };
 
-  return handlers[type]?.(payload) || Promise.resolve({ skipped: true });
+  return handlers[type]?.(payload, storeId) || Promise.resolve({ skipped: true });
 };

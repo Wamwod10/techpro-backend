@@ -809,16 +809,25 @@ router.post(
             },
           },
         });
+        const existingBySku = item.sku
+          ? await tx.product.findFirst({
+              where: {
+                ...getActiveProductWhere(req),
+                sku: item.sku,
+              },
+            })
+          : null;
+        const existingProduct = existingByName || existingBySku;
 
-        const shouldMerge = existingByName && item.duplicateAction !== "new";
+        const shouldMerge = existingProduct && item.duplicateAction !== "new";
 
         if (shouldMerge) {
           const product = await tx.product.update({
-            where: { id: existingByName.id },
+            where: { id: existingProduct.id },
             data: {
               quantity: { increment: item.quantity },
               stock: { increment: item.quantity },
-              category: item.category || existingByName.category,
+              category: item.category || existingProduct.category,
               costPrice: item.costPrice,
               sellPrice: item.sellPrice,
               price: item.sellPrice,

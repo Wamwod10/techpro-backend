@@ -468,6 +468,64 @@ const summarizeSales = (sales = []) => ({
   transactions: sales.length,
 });
 
+const getSalesDayTotals = (sales = []) => {
+  const totals = summarizeSales(sales);
+
+  return {
+    total: totals.totalSales,
+    cash: totals.cashSales,
+    card: totals.cardSales,
+    transfer: totals.transferSales,
+    returnedTotal: roundMoney(
+      sales.reduce((acc, sale) => acc + Number(sale.returnedTotal || 0), 0),
+    ),
+    count: sales.length,
+  };
+};
+
+const closeSalesDay = async (
+  client,
+  { storeId, dateISO, date, sales, closedBy, autoClosed = false },
+) => {
+  if (!sales.length) {
+    return null;
+  }
+
+  const dayTotals = getSalesDayTotals(sales);
+  const report = await client.salesDay.upsert({
+    where: { storeId_dateISO: { storeId, dateISO } },
+    create: {
+      storeId,
+      dateISO,
+      date: date || sales[0]?.date || toUzDate(),
+      ...dayTotals,
+      closedBy,
+      autoClosed,
+    },
+    update: {
+      total: { increment: dayTotals.total },
+      cash: { increment: dayTotals.cash },
+      card: { increment: dayTotals.card },
+      transfer: { increment: dayTotals.transfer },
+      returnedTotal: { increment: dayTotals.returnedTotal },
+      count: { increment: dayTotals.count },
+      closedBy,
+      autoClosed,
+    },
+  });
+
+  await client.sale.updateMany({
+    where: {
+      storeId,
+      id: { in: sales.map((sale) => sale.id) },
+      status: "active",
+    },
+    data: { status: "closed" },
+  });
+
+  return report;
+};
+
 const getShiftSalesWhere = (shift, closedAtISO) => ({
   storeId: shift.storeId,
   OR: [
@@ -560,20 +618,19 @@ const addActivityLog = async (data, user, client = prisma, storeId = DEFAULT_STO
 };
 
 const buildHistory = async ({ storeId, includeSensitive = true } = {}) => {
+  const todayISO = toISODate();
   const days = await prisma.salesDay.findMany({
     where: { storeId },
     orderBy: { dateISO: "desc" },
   });
 
-  if (!days.length) {
-    return [];
-  }
-
   const sales = await prisma.sale.findMany({
     where: {
       storeId,
-      status: "closed",
-      dateISO: { in: days.map((day) => day.dateISO) },
+      OR: [
+        { status: "closed" },
+        { dateISO: { lt: todayISO } },
+      ],
     },
     include: saleInclude,
     orderBy: { createdAt: "desc" },
@@ -586,10 +643,33 @@ const buildHistory = async ({ storeId, includeSensitive = true } = {}) => {
     salesByDate.set(sale.dateISO, dateSales);
   }
 
-  return days.map((day) => ({
-    ...day,
-    sales: salesByDate.get(day.dateISO) || [],
-  }));
+  const daysByDate = new Map(days.map((day) => [day.dateISO, day]));
+
+  for (const [dateISO, dateSales] of salesByDate.entries()) {
+    if (daysByDate.has(dateISO)) {
+      continue;
+    }
+
+    const dayTotals = getSalesDayTotals(dateSales);
+    daysByDate.set(dateISO, {
+      id: `recovered-${storeId}-${dateISO}`,
+      storeId,
+      dateISO,
+      date: dateSales[0]?.date || dateISO,
+      ...dayTotals,
+      closedBy: dateSales[0]?.sellerName || null,
+      autoClosed: true,
+      createdAt: dateSales[0]?.createdAt || null,
+      updatedAt: dateSales[0]?.updatedAt || null,
+    });
+  }
+
+  return [...daysByDate.values()]
+    .sort((a, b) => String(b.dateISO).localeCompare(String(a.dateISO)))
+    .map((day) => ({
+      ...day,
+      sales: salesByDate.get(day.dateISO) || [],
+    }));
 };
 
 router.use(attachRequestUser);
@@ -1309,46 +1389,25 @@ router.post(
   "/sales/close-day",
   asyncHandler(async (req, res) => {
     const dateISO = req.body.dateISO || toISODate();
-    const sales = await prisma.sale.findMany({
-      where: getStoreWhere(req, { status: "active", dateISO }),
-      include: saleInclude,
-    });
+    const report = await prisma.$transaction(async (tx) => {
+      const sales = await tx.sale.findMany({
+        where: getStoreWhere(req, { status: "active", dateISO }),
+        include: saleInclude,
+      });
 
-    if (!sales.length) {
-      return res.status(400).json({ message: "Yakunlanadigan savdolar yo'q" });
-    }
+      if (!sales.length) {
+        throw Object.assign(new Error("Yakunlanadigan savdolar yo'q"), {
+          status: 400,
+        });
+      }
 
-    const total = sales.reduce((acc, sale) => acc + getSaleGrossTotal(sale), 0);
-    const returnedTotal = sales.reduce((acc, sale) => acc + Number(sale.returnedTotal || 0), 0);
-
-    const report = await prisma.salesDay.upsert({
-      where: { storeId_dateISO: { storeId: req.storeId, dateISO } },
-      create: {
+      return closeSalesDay(tx, {
         storeId: req.storeId,
         dateISO,
         date: req.body.date || toUzDate(),
-        total,
-        cash: getPaymentTotal(sales, "cash"),
-        card: getPaymentTotal(sales, "card"),
-        transfer: getPaymentTotal(sales, "transfer"),
-        returnedTotal,
-        count: sales.length,
+        sales,
         closedBy: req.user.name,
-      },
-      update: {
-        total: { increment: total },
-        cash: { increment: getPaymentTotal(sales, "cash") },
-        card: { increment: getPaymentTotal(sales, "card") },
-        transfer: { increment: getPaymentTotal(sales, "transfer") },
-        returnedTotal: { increment: returnedTotal },
-        count: { increment: sales.length },
-        closedBy: req.user.name,
-      },
-    });
-
-    await prisma.sale.updateMany({
-      where: getStoreWhere(req, { status: "active", dateISO }),
-      data: { status: "closed" },
+      });
     });
 
     void notifyDailyReport(report, req.storeId);
@@ -1789,32 +1848,63 @@ router.post(
     }
 
     const now = new Date();
-    const sales = await prisma.sale.findMany({
-      where: getShiftSalesWhere(shift, now),
-    });
-    const shiftTotals = summarizeSales(sales);
-    const cashSales = shiftTotals.cashSales;
-    const closedShift = await prisma.shift.update({
-      where: { id: shift.id },
-      data: {
-        closedById: req.user.id,
-        closedByName: req.user.name,
-        closingCash: Number(req.body.closingCash || 0),
-        totalSales: shiftTotals.totalSales,
-        cashSales,
-        cardSales: shiftTotals.cardSales,
-        transferSales: shiftTotals.transferSales,
-        transactions: shiftTotals.transactions,
-        cashDifference: Number(req.body.closingCash || 0) - (Number(shift.openingCash || 0) + cashSales),
-        closedAt: toUzTime(now),
-        closedAtISO: now,
-        duration: formatDuration(shift.openedAtISO, now),
-        status: "closed",
-      },
+    const { closedShift, reports } = await prisma.$transaction(async (tx) => {
+      const sales = await tx.sale.findMany({
+        where: getShiftSalesWhere(shift, now),
+      });
+      const shiftTotals = summarizeSales(sales);
+      const cashSales = shiftTotals.cashSales;
+      const closedShift = await tx.shift.update({
+        where: { id: shift.id },
+        data: {
+          closedById: req.user.id,
+          closedByName: req.user.name,
+          closingCash: Number(req.body.closingCash || 0),
+          totalSales: shiftTotals.totalSales,
+          cashSales,
+          cardSales: shiftTotals.cardSales,
+          transferSales: shiftTotals.transferSales,
+          transactions: shiftTotals.transactions,
+          cashDifference: Number(req.body.closingCash || 0) - (Number(shift.openingCash || 0) + cashSales),
+          closedAt: toUzTime(now),
+          closedAtISO: now,
+          duration: formatDuration(shift.openedAtISO, now),
+          status: "closed",
+        },
+      });
+      const activeSalesByDate = new Map();
+
+      for (const sale of sales.filter((item) => item.status === "active")) {
+        const daySales = activeSalesByDate.get(sale.dateISO) || [];
+        daySales.push(sale);
+        activeSalesByDate.set(sale.dateISO, daySales);
+      }
+
+      const reports = [];
+
+      for (const [dateISO, daySales] of activeSalesByDate.entries()) {
+        const report = await closeSalesDay(tx, {
+          storeId: req.storeId,
+          dateISO,
+          date: daySales[0]?.date || toUzDate(now),
+          sales: daySales,
+          closedBy: req.user.name,
+          autoClosed: true,
+        });
+
+        if (report) {
+          reports.push(report);
+        }
+      }
+
+      return { closedShift, reports };
     });
 
     await addActivityLog({ type: "shift", title: "Shift yopildi", description: closedShift.cashierName }, req.user, prisma, req.storeId);
     void notifyShiftClose(closedShift, req.storeId);
+    reports.forEach((report) => {
+      void notifyDailyReport(report, req.storeId);
+    });
 
     res.json(closedShift);
   }),
@@ -1858,13 +1948,7 @@ router.get(
         include: saleInclude,
         orderBy: { createdAt: "desc" },
       }),
-      includeHistory
-        ? buildHistory({ storeId: req.storeId, includeSensitive: true })
-        : prisma.salesDay.findMany({
-            where: { storeId: req.storeId },
-            orderBy: { dateISO: "desc" },
-            take: 30,
-          }),
+      buildHistory({ storeId: req.storeId, includeSensitive: true }),
       prisma.expense.aggregate({
         where: getStoreWhere(req),
         _sum: { amount: true },
